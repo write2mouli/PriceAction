@@ -1,0 +1,380 @@
+//@version=5
+// ES Price Action - v1 STRATEGY
+// 2-legged pullback strategy. Same detection state machine as the v4 indicator,
+// with strategy.entry / strategy.exit wired up so TV runs the backtest natively.
+//
+// Defaults are set to the best cell from the Python backtest:
+//   - LONG-only (shorts lost money on the 60-day /ES sample which was bull-dominant)
+//   - Quality score >= 6 (grade A and B - captures the +$588 LONG B cell)
+//   - Structural stop (1 tick beyond leg-2 low)
+//   - Swing-high target (top of pullback)
+//   - RTH session only (9:30-16:00 ET)
+//
+// To enable shorts: flip "allow shorts" to true (treat results with caution
+// on bull-trend periods until validated on bear-period data).
+
+strategy("ES PA Strategy v1", overlay=true, initial_capital=25000, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.cash_per_contract, commission_value=1.25, slippage=1, pyramiding=0, calc_on_every_tick=false, process_orders_on_close=false, max_labels_count=500, max_lines_count=500)
+
+// ----------------------------------------------------------------------------
+// Inputs - Detection
+// ----------------------------------------------------------------------------
+ema_length         = input.int(21,  "EMA length",            minval=5, maxval=200,  group="01 Detection")
+ema_slope_lookback = input.int(5,   "EMA slope lookback (bars)", minval=1, maxval=30, group="01 Detection")
+ema_prox_ticks     = input.int(8,   "EMA proximity (ticks)", minval=0, maxval=80,  group="01 Detection")
+min_pullback_ticks = input.int(8,   "Min pullback depth (ticks)", minval=0, maxval=80, group="01 Detection")
+max_leg_bars       = input.int(15,  "Max bars per leg", minval=2, maxval=50,       group="01 Detection")
+require_sig_bar    = input.bool(false, "Require valid signal bar on trigger",       group="01 Detection")
+min_close_strength = input.float(0.55, "  Signal bar: min close strength", minval=0.0, maxval=1.0, step=0.05, group="01 Detection")
+min_body_fraction  = input.float(0.40, "  Signal bar: min body fraction",  minval=0.0, maxval=1.0, step=0.05, group="01 Detection")
+
+// ----------------------------------------------------------------------------
+// Inputs - Quality + sides
+// ----------------------------------------------------------------------------
+min_quality_score = input.int(6,   "Min quality score (0-10)", minval=0, maxval=10, tooltip="6 = grades B+ (recommended). 8 = A only. 0 = take everything.", group="02 Quality / sides")
+allow_longs       = input.bool(true,  "Allow longs",  group="02 Quality / sides")
+allow_shorts      = input.bool(false, "Allow shorts", tooltip="OFF by default. Backtest showed shorts losing on bull-dominant data; enable carefully.", group="02 Quality / sides")
+
+// ----------------------------------------------------------------------------
+// Inputs - Exits
+// ----------------------------------------------------------------------------
+stop_mode    = input.string("structural", "Stop mode",   options=["structural", "fixed_ticks"], group="03 Exits")
+stop_ticks   = input.int(8,   "Stop ticks (if fixed)", minval=1, maxval=80,                   group="03 Exits")
+target_mode  = input.string("swing", "Target mode",     options=["swing", "fixed_1pt", "fixed_2pt"], group="03 Exits")
+entry_expiry_bars = input.int(2, "Entry expiry (bars)", minval=1, maxval=20, tooltip="Cancel pending entry order if not filled within N bars.", group="03 Exits")
+
+// ----------------------------------------------------------------------------
+// Inputs - Risk + session
+// ----------------------------------------------------------------------------
+rth_only         = input.bool(true,  "RTH only (09:30-16:00 ET)",     group="04 Risk / session")
+max_daily_trades = input.int(6,      "Max trades per day",            minval=1, maxval=50, group="04 Risk / session")
+max_daily_loss   = input.float(750,  "Max daily loss ($)",            minval=50, group="04 Risk / session")
+
+// ----------------------------------------------------------------------------
+// Inputs - Visuals
+// ----------------------------------------------------------------------------
+show_ema         = input.bool(true, "Show 21 EMA",      group="05 Visuals")
+show_leg_markers = input.bool(true, "Show leg dots",    group="05 Visuals")
+draw_entry_lines = input.bool(true, "Draw entry / stop / target lines", group="05 Visuals")
+line_extend_bars = input.int(40,    "Lines extend N bars",  minval=5, maxval=200, group="05 Visuals")
+
+// ============================================================================
+// Indicators + trend
+// ============================================================================
+tick_sz = syminfo.mintick
+ema21   = ta.ema(close, ema_length)
+
+plot(show_ema ? ema21 : na, "EMA", color=color.new(color.blue, 0), linewidth=2)
+
+ema_up   = ema21 > ema21[ema_slope_lookback]
+ema_down = ema21 < ema21[ema_slope_lookback]
+bull_trend = ema_up   and close > ema21
+bear_trend = ema_down and close < ema21
+
+// Session
+is_rth() =>
+    h = hour(time, "America/New_York")
+    m = minute(time, "America/New_York")
+    d = dayofweek(time, "America/New_York")
+    wkd = d >= dayofweek.monday and d <= dayofweek.friday
+    aft = h > 9 or (h == 9 and m >= 30)
+    bef = h < 16
+    wkd and aft and bef
+in_session = (not rth_only) or is_rth()
+
+// Apply built-in risk caps
+strategy.risk.max_intraday_filled_orders(max_daily_trades)
+strategy.risk.max_intraday_loss(max_daily_loss, strategy.cash)
+
+// ============================================================================
+// Signal bar gate
+// ============================================================================
+rng     = high - low
+body    = math.abs(close - open)
+cs_bull = rng > 0 ? (close - low)  / rng : 0.0
+cs_bear = rng > 0 ? (high - close) / rng : 0.0
+valid_long_sig  = close > open and rng > 0 and body >= min_body_fraction * rng and cs_bull >= min_close_strength
+valid_short_sig = close < open and rng > 0 and body >= min_body_fraction * rng and cs_bear >= min_close_strength
+
+// ============================================================================
+// BULL state machine + score
+// ============================================================================
+var int   bull_state          = 0
+var int   bull_leg_start      = na
+var float bull_swing_high     = na
+var bool  bull_ema_touched    = false
+var int   bull_l1_bars        = 0
+var int   bull_l1_ll          = 0
+var float bull_l1_low         = na
+var int   bull_l2_bars        = 0
+var int   bull_l2_ll          = 0
+var float bull_l2_low         = na
+var bool  bull_fire           = false
+bull_fire := false
+
+prox = ema_prox_ticks * tick_sz
+bull_pb_continues = high <= high[1]
+bull_pb_breaks    = high >  high[1]
+
+if not bull_trend
+    bull_state := 0
+    bull_swing_high := na
+    bull_ema_touched := false
+    bull_l1_bars := 0
+    bull_l1_ll := 0
+    bull_l1_low := na
+    bull_l2_bars := 0
+    bull_l2_ll := 0
+    bull_l2_low := na
+
+if bull_trend
+    if bull_state == 0
+        if bull_pb_continues
+            bull_state := 1
+            bull_leg_start := bar_index
+            bull_swing_high := high[1]
+            bull_l1_bars := 1
+            bull_l1_ll := low < low[1] ? 1 : 0
+            bull_l1_low := low
+            bull_l2_bars := 0
+            bull_l2_ll := 0
+            bull_l2_low := na
+            bull_ema_touched := low <= ema21 + prox
+    else if bull_state == 1
+        if high > bull_swing_high
+            bull_state := 0
+        else if bar_index - bull_leg_start > max_leg_bars
+            bull_state := 0
+        else if bull_pb_breaks
+            bull_state := 2
+            bull_leg_start := bar_index
+        else
+            bull_l1_bars := bull_l1_bars + 1
+            if low < low[1]
+                bull_l1_ll := bull_l1_ll + 1
+            bull_l1_low := math.min(bull_l1_low, low)
+            if low <= ema21 + prox
+                bull_ema_touched := true
+    else if bull_state == 2
+        if high > bull_swing_high
+            bull_state := 0
+        else if bull_pb_continues
+            bull_state := 3
+            bull_leg_start := bar_index
+            bull_l2_bars := 1
+            bull_l2_ll := low < low[1] ? 1 : 0
+            bull_l2_low := low
+            if low <= ema21 + prox
+                bull_ema_touched := true
+    else if bull_state == 3
+        if high > bull_swing_high
+            bull_state := 0
+        else if bar_index - bull_leg_start > max_leg_bars
+            bull_state := 0
+        else if bull_pb_breaks
+            bull_fire := true
+            bull_state := 0
+        else
+            bull_l2_bars := bull_l2_bars + 1
+            if low < low[1]
+                bull_l2_ll := bull_l2_ll + 1
+            bull_l2_low := math.min(bull_l2_low, low)
+            if low <= ema21 + prox
+                bull_ema_touched := true
+
+// NOTE: forced float division. Pine v5 int/int truncates (e.g. 2/3 = 0).
+bull_l1_mom  = bull_l1_bars > 0 ? bull_l1_ll * 1.0 / bull_l1_bars : 0.0
+bull_l2_mom  = bull_l2_bars > 0 ? bull_l2_ll * 1.0 / bull_l2_bars : 0.0
+bull_s_l1    = math.round(bull_l1_mom * 3)
+bull_s_l2    = math.round(bull_l2_mom * 3)
+bull_s_depth = (not na(bull_l2_low) and not na(bull_l1_low) and bull_l2_low >  bull_l1_low) ? 3 : ((not na(bull_l2_low) and not na(bull_l1_low) and bull_l2_low >= bull_l1_low - 2 * tick_sz) ? 1 : 0)
+bull_s_bars  = (bull_l1_bars >= 2 and bull_l2_bars >= 2) ? 1 : 0
+bull_score   = bull_s_l1 + bull_s_l2 + bull_s_depth + bull_s_bars
+bull_depth_ok = not na(bull_swing_high) and not na(bull_l1_low) and (bull_swing_high - math.min(bull_l1_low, nz(bull_l2_low, bull_l1_low))) >= min_pullback_ticks * tick_sz
+
+fire_2EL = bull_fire and bull_depth_ok and bull_ema_touched and bull_score >= min_quality_score and (not require_sig_bar or valid_long_sig) and allow_longs and in_session
+
+// Capture entry / stop / target on the trigger bar
+var float p_long_entry  = na
+var float p_long_stop   = na
+var float p_long_target = na
+if fire_2EL
+    p_long_entry  := high[1] + tick_sz
+    p_long_stop   := stop_mode == "fixed_ticks" ? (p_long_entry - stop_ticks * tick_sz) : (nz(bull_l2_low, bull_l1_low) - tick_sz)
+    p_long_target := target_mode == "fixed_1pt" ? (p_long_entry + 4 * tick_sz) : target_mode == "fixed_2pt" ? (p_long_entry + 8 * tick_sz) : bull_swing_high
+
+// ============================================================================
+// BEAR state machine + score
+// ============================================================================
+var int   bear_state          = 0
+var int   bear_leg_start      = na
+var float bear_swing_low      = na
+var bool  bear_ema_touched    = false
+var int   bear_l1_bars        = 0
+var int   bear_l1_hh          = 0
+var float bear_l1_high        = na
+var int   bear_l2_bars        = 0
+var int   bear_l2_hh          = 0
+var float bear_l2_high        = na
+var bool  bear_fire           = false
+bear_fire := false
+
+bear_pb_continues = low >= low[1]
+bear_pb_breaks    = low <  low[1]
+
+if not bear_trend
+    bear_state := 0
+    bear_swing_low := na
+    bear_ema_touched := false
+    bear_l1_bars := 0
+    bear_l1_hh := 0
+    bear_l1_high := na
+    bear_l2_bars := 0
+    bear_l2_hh := 0
+    bear_l2_high := na
+
+if bear_trend
+    if bear_state == 0
+        if bear_pb_continues
+            bear_state := 1
+            bear_leg_start := bar_index
+            bear_swing_low := low[1]
+            bear_l1_bars := 1
+            bear_l1_hh := high > high[1] ? 1 : 0
+            bear_l1_high := high
+            bear_l2_bars := 0
+            bear_l2_hh := 0
+            bear_l2_high := na
+            bear_ema_touched := high >= ema21 - prox
+    else if bear_state == 1
+        if low < bear_swing_low
+            bear_state := 0
+        else if bar_index - bear_leg_start > max_leg_bars
+            bear_state := 0
+        else if bear_pb_breaks
+            bear_state := 2
+            bear_leg_start := bar_index
+        else
+            bear_l1_bars := bear_l1_bars + 1
+            if high > high[1]
+                bear_l1_hh := bear_l1_hh + 1
+            bear_l1_high := math.max(bear_l1_high, high)
+            if high >= ema21 - prox
+                bear_ema_touched := true
+    else if bear_state == 2
+        if low < bear_swing_low
+            bear_state := 0
+        else if bear_pb_continues
+            bear_state := 3
+            bear_leg_start := bar_index
+            bear_l2_bars := 1
+            bear_l2_hh := high > high[1] ? 1 : 0
+            bear_l2_high := high
+            if high >= ema21 - prox
+                bear_ema_touched := true
+    else if bear_state == 3
+        if low < bear_swing_low
+            bear_state := 0
+        else if bar_index - bear_leg_start > max_leg_bars
+            bear_state := 0
+        else if bear_pb_breaks
+            bear_fire := true
+            bear_state := 0
+        else
+            bear_l2_bars := bear_l2_bars + 1
+            if high > high[1]
+                bear_l2_hh := bear_l2_hh + 1
+            bear_l2_high := math.max(bear_l2_high, high)
+            if high >= ema21 - prox
+                bear_ema_touched := true
+
+// NOTE: forced float division. Pine v5 int/int truncates (e.g. 2/3 = 0).
+bear_l1_mom  = bear_l1_bars > 0 ? bear_l1_hh * 1.0 / bear_l1_bars : 0.0
+bear_l2_mom  = bear_l2_bars > 0 ? bear_l2_hh * 1.0 / bear_l2_bars : 0.0
+bear_s_l1    = math.round(bear_l1_mom * 3)
+bear_s_l2    = math.round(bear_l2_mom * 3)
+bear_s_depth = (not na(bear_l2_high) and not na(bear_l1_high) and bear_l2_high <  bear_l1_high) ? 3 : ((not na(bear_l2_high) and not na(bear_l1_high) and bear_l2_high <= bear_l1_high + 2 * tick_sz) ? 1 : 0)
+bear_s_bars  = (bear_l1_bars >= 2 and bear_l2_bars >= 2) ? 1 : 0
+bear_score   = bear_s_l1 + bear_s_l2 + bear_s_depth + bear_s_bars
+bear_depth_ok = not na(bear_swing_low) and not na(bear_l1_high) and (math.max(bear_l1_high, nz(bear_l2_high, bear_l1_high)) - bear_swing_low) >= min_pullback_ticks * tick_sz
+
+fire_2ES = bear_fire and bear_depth_ok and bear_ema_touched and bear_score >= min_quality_score and (not require_sig_bar or valid_short_sig) and allow_shorts and in_session
+
+var float p_short_entry  = na
+var float p_short_stop   = na
+var float p_short_target = na
+if fire_2ES
+    p_short_entry  := low[1] - tick_sz
+    p_short_stop   := stop_mode == "fixed_ticks" ? (p_short_entry + stop_ticks * tick_sz) : (nz(bear_l2_high, bear_l1_high) + tick_sz)
+    p_short_target := target_mode == "fixed_1pt" ? (p_short_entry - 4 * tick_sz) : target_mode == "fixed_2pt" ? (p_short_entry - 8 * tick_sz) : bear_swing_low
+
+// ============================================================================
+// Helpers
+// ============================================================================
+grade_for(s) =>
+    s >= 8 ? "A" : s >= 6 ? "B" : s >= 4 ? "C" : "D"
+color_for(s) =>
+    s >= 8 ? color.lime : s >= 6 ? color.new(#7fc97f, 0) : s >= 4 ? color.yellow : color.orange
+
+// ============================================================================
+// Strategy: place orders on trigger bars
+// ============================================================================
+// Track pending entries so we can cancel after expiry.
+var int  pending_long_bar  = na
+var int  pending_short_bar = na
+
+if fire_2EL and strategy.position_size == 0
+    strategy.entry("2EL", strategy.long, stop=p_long_entry, comment="2EL " + grade_for(bull_score) + str.tostring(bull_score))
+    strategy.exit("2EL_x", from_entry="2EL", stop=p_long_stop, limit=p_long_target, comment_loss="stop", comment_profit="target")
+    pending_long_bar := bar_index
+
+if fire_2ES and strategy.position_size == 0
+    strategy.entry("2ES", strategy.short, stop=p_short_entry, comment="2ES " + grade_for(bear_score) + str.tostring(bear_score))
+    strategy.exit("2ES_x", from_entry="2ES", stop=p_short_stop, limit=p_short_target, comment_loss="stop", comment_profit="target")
+    pending_short_bar := bar_index
+
+// Cancel pending entries that haven't filled after entry_expiry_bars
+if not na(pending_long_bar) and bar_index - pending_long_bar > entry_expiry_bars and strategy.position_size == 0
+    strategy.cancel("2EL")
+    pending_long_bar := na
+if not na(pending_short_bar) and bar_index - pending_short_bar > entry_expiry_bars and strategy.position_size == 0
+    strategy.cancel("2ES")
+    pending_short_bar := na
+
+// Clear pending tracker once filled
+if strategy.position_size != 0
+    pending_long_bar := na
+    pending_short_bar := na
+
+// ============================================================================
+// Visual leg markers (helpful for sanity-checking detection)
+// ============================================================================
+in_bull_leg1 = bull_state == 1
+in_bull_leg2 = bull_state == 3
+in_bear_leg1 = bear_state == 1
+in_bear_leg2 = bear_state == 3
+plotshape(show_leg_markers and in_bull_leg1, title="bull leg1", style=shape.circle, location=location.belowbar, color=color.new(color.aqua,   50), size=size.tiny)
+plotshape(show_leg_markers and in_bull_leg2, title="bull leg2", style=shape.circle, location=location.belowbar, color=color.new(color.yellow, 30), size=size.tiny)
+plotshape(show_leg_markers and in_bear_leg1, title="bear leg1", style=shape.circle, location=location.abovebar, color=color.new(color.aqua,   50), size=size.tiny)
+plotshape(show_leg_markers and in_bear_leg2, title="bear leg2", style=shape.circle, location=location.abovebar, color=color.new(color.yellow, 30), size=size.tiny)
+
+// Entry / stop / target lines
+if draw_entry_lines and fire_2EL
+    line.new(bar_index, p_long_entry,  bar_index + line_extend_bars, p_long_entry,  color=color.white, width=1, style=line.style_dashed)
+    line.new(bar_index, p_long_stop,   bar_index + line_extend_bars, p_long_stop,   color=color.red,   width=1, style=line.style_dotted)
+    line.new(bar_index, p_long_target, bar_index + line_extend_bars, p_long_target, color=color.lime,  width=1, style=line.style_dotted)
+if draw_entry_lines and fire_2ES
+    line.new(bar_index, p_short_entry,  bar_index + line_extend_bars, p_short_entry,  color=color.white, width=1, style=line.style_dashed)
+    line.new(bar_index, p_short_stop,   bar_index + line_extend_bars, p_short_stop,   color=color.red,   width=1, style=line.style_dotted)
+    line.new(bar_index, p_short_target, bar_index + line_extend_bars, p_short_target, color=color.lime,  width=1, style=line.style_dotted)
+
+// Signal labels
+if fire_2EL
+    label.new(bar_index, low, "2EL " + grade_for(bull_score) + str.tostring(bull_score), style=label.style_label_up, color=color_for(bull_score), textcolor=color.white, size=size.small, yloc=yloc.belowbar)
+if fire_2ES
+    label.new(bar_index, high, "2ES " + grade_for(bear_score) + str.tostring(bear_score), style=label.style_label_down, color=color_for(bear_score), textcolor=color.white, size=size.small, yloc=yloc.abovebar)
+
+// ============================================================================
+// Alerts
+// ============================================================================
+alertcondition(fire_2EL, title="2EL signal", message="ES PA Strategy: 2-legged pullback long")
+alertcondition(fire_2ES, title="2ES signal", message="ES PA Strategy: 2-legged pullback short")

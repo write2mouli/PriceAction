@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Python backtest output (generated artifacts)
+python/out/
+
+# Claude Code project-local settings
+.claude/
+
+# NinjaTrader compiled artifacts (if ever generated locally)
+bin/
+obj/
+*.dll
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
