@@ -397,17 +397,28 @@ linreg_arr(bars_arr, prices_arr) =>
     intercept = mean_y - slope * mean_x
     [slope, intercept]
 
-// ---- Bear channel formation (regression-based) ----
+// ---- Bear channel: progressive outlier-aware update ----
+// Phase 1 (no channel yet): collect ALL qualifying PHs in rolling window.
+//                           Fit regression on every new pivot.
+//                           Activate when fit produces >= channel_min_pivots touches.
+// Phase 2 (channel active): only ADD new qualifying PH to the regression set
+//                           if it lies within touch tolerance of the current line.
+//                           Outliers are ignored - they don't drag the slope.
+//                           Each accepted new pivot increments touches and refits.
 if ph_qualifies
     ph_value = high[channel_pivot_strength]
     ph_bar   = bar_index - channel_pivot_strength
-    // If this PH is higher than all in array, it might signal a new leg / wider channel.
-    // Don't clear — let the rolling window evict naturally.
-    array.push(bear_pivot_h, ph_value)
-    array.push(bear_pivot_b, ph_bar)
-    while array.size(bear_pivot_h) > channel_max_pivots
-        array.shift(bear_pivot_h)
-        array.shift(bear_pivot_b)
+    include_in_fit = true
+    if bear_channel_active
+        // Only include if within tolerance of current line
+        line_y_at_pivot = bear_regression_intercept + bear_regression_slope * ph_bar
+        include_in_fit := math.abs(ph_value - line_y_at_pivot) <= channel_touch_atr * atr14[channel_pivot_strength]
+    if include_in_fit
+        array.push(bear_pivot_h, ph_value)
+        array.push(bear_pivot_b, ph_bar)
+        while array.size(bear_pivot_h) > channel_max_pivots
+            array.shift(bear_pivot_h)
+            array.shift(bear_pivot_b)
 
 if pl_qualifies and bear_channel_active
     pl_value = low[channel_pivot_strength]
@@ -416,10 +427,9 @@ if pl_qualifies and bear_channel_active
         bear_C_price := pl_value
         bear_C_bar   := pl_bar
 
-// Re-evaluate bear channel from current pivot set
+// Recompute regression from the (possibly outlier-filtered) pivot set
 if array.size(bear_pivot_h) >= channel_min_pivots
     [slp, icpt] = linreg_arr(bear_pivot_b, bear_pivot_h)
-    // Bear channel requires descending slope
     if slp < 0
         bear_regression_slope := slp
         bear_regression_intercept := icpt
@@ -427,7 +437,6 @@ if array.size(bear_pivot_h) >= channel_min_pivots
         bear_A_price := icpt + slp * bear_A_bar
         bear_B_bar := array.last(bear_pivot_b)
         bear_B_price := icpt + slp * bear_B_bar
-        // Touch count: pivots within tolerance of the regression line
         touches = 0
         for i = 0 to array.size(bear_pivot_h) - 1
             xv = array.get(bear_pivot_b, i)
@@ -436,19 +445,23 @@ if array.size(bear_pivot_h) >= channel_min_pivots
             if math.abs(yv - line_y) <= channel_touch_atr * atr14
                 touches := touches + 1
         bear_touches := touches
-        // Activate if we have enough pivots and at least 2 touches
-        if bear_touches >= 2 and not bear_channel_active
+        if bear_touches >= channel_min_pivots and not bear_channel_active
             bear_channel_active := true
 
-// ---- Bull channel formation (mirror) ----
+// ---- Bull channel (mirror) ----
 if pl_qualifies
     pl_value = low[channel_pivot_strength]
     pl_bar   = bar_index - channel_pivot_strength
-    array.push(bull_pivot_l, pl_value)
-    array.push(bull_pivot_b, pl_bar)
-    while array.size(bull_pivot_l) > channel_max_pivots
-        array.shift(bull_pivot_l)
-        array.shift(bull_pivot_b)
+    include_in_fit = true
+    if bull_channel_active
+        line_y_at_pivot = bull_regression_intercept + bull_regression_slope * pl_bar
+        include_in_fit := math.abs(pl_value - line_y_at_pivot) <= channel_touch_atr * atr14[channel_pivot_strength]
+    if include_in_fit
+        array.push(bull_pivot_l, pl_value)
+        array.push(bull_pivot_b, pl_bar)
+        while array.size(bull_pivot_l) > channel_max_pivots
+            array.shift(bull_pivot_l)
+            array.shift(bull_pivot_b)
 
 if ph_qualifies and bull_channel_active
     ph_value = high[channel_pivot_strength]
@@ -474,7 +487,7 @@ if array.size(bull_pivot_l) >= channel_min_pivots
             if math.abs(yv - line_y) <= channel_touch_atr * atr14
                 touches := touches + 1
         bull_touches := touches
-        if bull_touches >= 2 and not bull_channel_active
+        if bull_touches >= channel_min_pivots and not bull_channel_active
             bull_channel_active := true
 
 // ---- Channel line equations (using regression slope) ----
