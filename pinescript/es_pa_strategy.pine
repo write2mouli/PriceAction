@@ -328,7 +328,8 @@ if fire_2ES
 channel_overshoot_atr     = input.float(0.25, "Channel overshoot threshold (xATR)", minval=0.05, maxval=2.0, step=0.05, group="06 Channel filter")
 channel_breakout_atr      = input.float(0.25, "Channel breakout threshold (xATR)",  minval=0.05, maxval=2.0, step=0.05, group="06 Channel filter")
 channel_block_bars        = input.int(30, "Block opposite trades after overshoot (bars)", minval=1, maxval=200, group="06 Channel filter")
-channel_pivot_prominence  = input.float(0.5, "Min pivot prominence (xATR from EMA)", minval=0.0, maxval=3.0, step=0.1, tooltip="Pivot must be at least this many ATRs away from EMA21 to qualify. Filters out micro-pivots in consolidation.", group="06 Channel filter")
+channel_atr_prominence    = input.float(0.5, "Pivot prominence vs neighbors (xATR)", minval=0.0, maxval=3.0, step=0.1, tooltip="Pivot's high (or low) must stand out by at least this many ATRs from the highs (or lows) of neighboring bars on BOTH sides. Symmetric, no EMA dependency.", group="06 Channel filter")
+channel_atr_confirmation  = input.float(1.0, "Pivot confirmation reversal (xATR)", minval=0.1, maxval=5.0, step=0.1, tooltip="ZigZag-style: a candidate pivot is only confirmed after price moves this many ATRs in the OPPOSITE direction. Filters out 'looked like a pivot but wasn't' wiggles.", group="06 Channel filter")
 channel_min_pivots        = input.int(2, "Min pivots to form channel", minval=2, maxval=5, group="06 Channel filter")
 channel_max_pivots        = input.int(8, "Max pivots in rolling window", minval=2, maxval=20, tooltip="Older pivots beyond this count are evicted from the regression set.", group="06 Channel filter")
 channel_touch_atr         = input.float(0.5, "Touch tolerance (xATR)", minval=0.05, maxval=2.0, step=0.05, tooltip="A pivot counts as a 'touch' of the trendline if within this many ATRs of it.", group="06 Channel filter")
@@ -337,15 +338,72 @@ draw_channels             = input.bool(true, "Draw active channel lines", group=
 channel_pivot_strength    = input.int(3,  "Channel pivot strength (bars)", minval=1, maxval=10, group="06 Channel filter")
 
 atr14 = ta.atr(14)
-ph = ta.pivothigh(high, channel_pivot_strength, channel_pivot_strength)
-pl = ta.pivotlow(low,  channel_pivot_strength, channel_pivot_strength)
 
-// Pivot prominence (distance from EMA at pivot bar)
-ph_prom = not na(ph) ? math.abs(ph - ema21[channel_pivot_strength]) : 0.0
-pl_prom = not na(pl) ? math.abs(pl - ema21[channel_pivot_strength]) : 0.0
-prom_threshold = channel_pivot_prominence * atr14[channel_pivot_strength]
-ph_qualifies = not na(ph) and ph_prom >= prom_threshold
-pl_qualifies = not na(pl) and pl_prom >= prom_threshold
+// ============================================================================
+// 3-Stage Pivot Detection (Brooks "major swing point" / LuxAlgo-style)
+// ----------------------------------------------------------------------------
+// Stage 1: Williams fractal candidate (ta.pivothigh / ta.pivotlow)
+// Stage 2: Prominence vs LOCAL NEIGHBORS by N ATR. Symmetric - works for both
+//          bull and bear; no EMA dependency.
+// Stage 3: ZigZag confirmation - candidate is only "published" once price moves
+//          N ATRs in the OPPOSITE direction (Brooks: trend-change attempt of
+//          comparable size; Grimes: 1 ATR retracement confirms).
+// ============================================================================
+
+// Stage 1: candidates
+ph_cand = ta.pivothigh(high, channel_pivot_strength, channel_pivot_strength)
+pl_cand = ta.pivotlow(low,  channel_pivot_strength, channel_pivot_strength)
+
+// Stage 2: prominence vs neighbors (3 bars left + 3 bars right of pivot bar)
+// Pivot bar is at (bar_index - channel_pivot_strength). Compare pivot's high to
+// the highest of the 3 bars on each side (excluding pivot bar).
+ph_right_max = ta.highest(high, channel_pivot_strength)
+ph_left_max  = ta.highest(high, channel_pivot_strength)[channel_pivot_strength + 1]
+ph_nbr_max   = math.max(ph_left_max, ph_right_max)
+ph_prominent = not na(ph_cand) and (ph_cand - ph_nbr_max) >= channel_atr_prominence * atr14[channel_pivot_strength]
+
+pl_right_min = ta.lowest(low, channel_pivot_strength)
+pl_left_min  = ta.lowest(low, channel_pivot_strength)[channel_pivot_strength + 1]
+pl_nbr_min   = math.min(pl_left_min, pl_right_min)
+pl_prominent = not na(pl_cand) and (pl_nbr_min - pl_cand) >= channel_atr_prominence * atr14[channel_pivot_strength]
+
+// Stage 3: ZigZag confirmation
+var float ph_pending_price = na
+var int   ph_pending_bar   = na
+var float pl_pending_price = na
+var int   pl_pending_bar   = na
+
+// Track the most extreme prominent candidate until it's confirmed or replaced
+if ph_prominent
+    if na(ph_pending_price) or ph_cand > ph_pending_price
+        ph_pending_price := ph_cand
+        ph_pending_bar   := bar_index - channel_pivot_strength
+if pl_prominent
+    if na(pl_pending_price) or pl_cand < pl_pending_price
+        pl_pending_price := pl_cand
+        pl_pending_bar   := bar_index - channel_pivot_strength
+
+// Confirm when price moves N ATR in opposite direction
+confirm_dist = channel_atr_confirmation * atr14
+ph_confirmed = not na(ph_pending_price) and (ph_pending_price - low) >= confirm_dist
+pl_confirmed = not na(pl_pending_price) and (high - pl_pending_price) >= confirm_dist
+
+// Expose confirmed pivot's PRICE + BAR (might be many bars in the past)
+// for the channel formation code that consumes ph_qualifies / pl_qualifies.
+ph_qualifies = ph_confirmed
+pl_qualifies = pl_confirmed
+ph_value_final = ph_qualifies ? ph_pending_price : na
+ph_bar_final   = ph_qualifies ? ph_pending_bar   : na
+pl_value_final = pl_qualifies ? pl_pending_price : na
+pl_bar_final   = pl_qualifies ? pl_pending_bar   : na
+
+// Reset pending slots after publishing
+if ph_confirmed
+    ph_pending_price := na
+    ph_pending_bar   := na
+if pl_confirmed
+    pl_pending_price := na
+    pl_pending_bar   := na
 
 // ---- Bear channel state ----
 var array<float> bear_pivot_h = array.new<float>()  // qualifying PHs (rolling window)
@@ -398,21 +456,13 @@ linreg_arr(bars_arr, prices_arr) =>
     [slope, intercept]
 
 // ---- Bear channel: progressive outlier-aware update ----
-// Phase 1 (no channel yet): collect ALL qualifying PHs in rolling window.
-//                           Fit regression on every new pivot.
-//                           Activate when fit produces >= channel_min_pivots touches.
-// Phase 2 (channel active): only ADD new qualifying PH to the regression set
-//                           if it lies within touch tolerance of the current line.
-//                           Outliers are ignored - they don't drag the slope.
-//                           Each accepted new pivot increments touches and refits.
 if ph_qualifies
-    ph_value = high[channel_pivot_strength]
-    ph_bar   = bar_index - channel_pivot_strength
+    ph_value = ph_value_final
+    ph_bar   = ph_bar_final
     include_in_fit = true
     if bear_channel_active
-        // Only include if within tolerance of current line
         line_y_at_pivot = bear_regression_intercept + bear_regression_slope * ph_bar
-        include_in_fit := math.abs(ph_value - line_y_at_pivot) <= channel_touch_atr * atr14[channel_pivot_strength]
+        include_in_fit := math.abs(ph_value - line_y_at_pivot) <= channel_touch_atr * atr14
     if include_in_fit
         array.push(bear_pivot_h, ph_value)
         array.push(bear_pivot_b, ph_bar)
@@ -421,8 +471,8 @@ if ph_qualifies
             array.shift(bear_pivot_b)
 
 if pl_qualifies and bear_channel_active
-    pl_value = low[channel_pivot_strength]
-    pl_bar   = bar_index - channel_pivot_strength
+    pl_value = pl_value_final
+    pl_bar   = pl_bar_final
     if pl_bar > bear_A_bar and (na(bear_C_price) or pl_value < bear_C_price)
         bear_C_price := pl_value
         bear_C_bar   := pl_bar
@@ -458,12 +508,12 @@ if array.size(bear_pivot_h) >= channel_min_pivots
 
 // ---- Bull channel (mirror) ----
 if pl_qualifies
-    pl_value = low[channel_pivot_strength]
-    pl_bar   = bar_index - channel_pivot_strength
+    pl_value = pl_value_final
+    pl_bar   = pl_bar_final
     include_in_fit = true
     if bull_channel_active
         line_y_at_pivot = bull_regression_intercept + bull_regression_slope * pl_bar
-        include_in_fit := math.abs(pl_value - line_y_at_pivot) <= channel_touch_atr * atr14[channel_pivot_strength]
+        include_in_fit := math.abs(pl_value - line_y_at_pivot) <= channel_touch_atr * atr14
     if include_in_fit
         array.push(bull_pivot_l, pl_value)
         array.push(bull_pivot_b, pl_bar)
@@ -472,8 +522,8 @@ if pl_qualifies
             array.shift(bull_pivot_b)
 
 if ph_qualifies and bull_channel_active
-    ph_value = high[channel_pivot_strength]
-    ph_bar   = bar_index - channel_pivot_strength
+    ph_value = ph_value_final
+    ph_bar   = ph_bar_final
     if ph_bar > bull_A_bar and (na(bull_C_price) or ph_value > bull_C_price)
         bull_C_price := ph_value
         bull_C_bar   := ph_bar
@@ -661,7 +711,7 @@ if barstate.islast
     bull_state_text = bull_channel_active ? (in_bull_post_overshoot ? "BULL-OVERSHOT(" + str.tostring(bar_index - last_bull_overshoot_bar) + "b)" : "BULL-ACTIVE(" + str.tostring(bull_touches) + "t)") : (na(bull_A_price) ? "BULL-none" : "BULL-waiting-B")
     bear_anchors = "Bear A=" + (na(bear_A_price) ? "-" : str.tostring(bear_A_price, "#.##") + "@b" + str.tostring(bar_index - bear_A_bar)) + "  B=" + (na(bear_B_price) ? "-" : str.tostring(bear_B_price, "#.##") + "@b" + str.tostring(bar_index - bear_B_bar)) + "  C=" + (na(bear_C_price) ? "-" : str.tostring(bear_C_price, "#.##") + "@b" + str.tostring(bar_index - bear_C_bar))
     bull_anchors = "Bull A=" + (na(bull_A_price) ? "-" : str.tostring(bull_A_price, "#.##") + "@b" + str.tostring(bar_index - bull_A_bar)) + "  B=" + (na(bull_B_price) ? "-" : str.tostring(bull_B_price, "#.##") + "@b" + str.tostring(bar_index - bull_B_bar)) + "  C=" + (na(bull_C_price) ? "-" : str.tostring(bull_C_price, "#.##") + "@b" + str.tostring(bar_index - bull_C_bar))
-    atr_text = "ATR=" + str.tostring(atr14, "#.##") + "  prom>=" + str.tostring(prom_threshold, "#.##") + "  [v2-sticky]"
+    atr_text = "ATR=" + str.tostring(atr14, "#.##") + "  prom>=" + str.tostring(channel_atr_prominence * atr14, "#.##") + "  confirm>=" + str.tostring(channel_atr_confirmation * atr14, "#.##") + "  [v3-3stage]"
     status_text = bear_state_text + " | " + bull_state_text + "\n" + bear_anchors + "\n" + bull_anchors + "\n" + atr_text
     channel_status_label := label.new(bar_index, high, status_text, color=color.new(color.black, 20), textcolor=color.white, style=label.style_label_left, xloc=xloc.bar_index, size=size.normal)
 
