@@ -427,21 +427,29 @@ if pl_qualifies and bear_channel_active
         bear_C_price := pl_value
         bear_C_bar   := pl_bar
 
-// Recompute regression from the (possibly outlier-filtered) pivot set
+// Recompute regression, then shift intercept UP so line passes through highest pivot
+// (upper envelope - matches manual trendline drawing through the highest lower-highs)
 if array.size(bear_pivot_h) >= channel_min_pivots
-    [slp, icpt] = linreg_arr(bear_pivot_b, bear_pivot_h)
+    [slp, _icpt] = linreg_arr(bear_pivot_b, bear_pivot_h)
     if slp < 0
+        // Find the maximum required intercept so line passes through ALL pivots from above
+        env_intercept = -1e10
+        for i = 0 to array.size(bear_pivot_h) - 1
+            xv = array.get(bear_pivot_b, i)
+            yv = array.get(bear_pivot_h, i)
+            required = yv - slp * xv     // intercept needed for line to pass through (xv, yv)
+            env_intercept := math.max(env_intercept, required)
         bear_regression_slope := slp
-        bear_regression_intercept := icpt
+        bear_regression_intercept := env_intercept
         bear_A_bar := array.first(bear_pivot_b)
-        bear_A_price := icpt + slp * bear_A_bar
+        bear_A_price := env_intercept + slp * bear_A_bar
         bear_B_bar := array.last(bear_pivot_b)
-        bear_B_price := icpt + slp * bear_B_bar
+        bear_B_price := env_intercept + slp * bear_B_bar
         touches = 0
         for i = 0 to array.size(bear_pivot_h) - 1
             xv = array.get(bear_pivot_b, i)
             yv = array.get(bear_pivot_h, i)
-            line_y = icpt + slp * xv
+            line_y = env_intercept + slp * xv
             if math.abs(yv - line_y) <= channel_touch_atr * atr14
                 touches := touches + 1
         bear_touches := touches
@@ -471,19 +479,26 @@ if ph_qualifies and bull_channel_active
         bull_C_bar   := ph_bar
 
 if array.size(bull_pivot_l) >= channel_min_pivots
-    [slp, icpt] = linreg_arr(bull_pivot_b, bull_pivot_l)
+    [slp, _icpt] = linreg_arr(bull_pivot_b, bull_pivot_l)
     if slp > 0
+        // For bull: line below all pivots (lower envelope through lowest higher-lows)
+        env_intercept = 1e10
+        for i = 0 to array.size(bull_pivot_l) - 1
+            xv = array.get(bull_pivot_b, i)
+            yv = array.get(bull_pivot_l, i)
+            required = yv - slp * xv
+            env_intercept := math.min(env_intercept, required)
         bull_regression_slope := slp
-        bull_regression_intercept := icpt
+        bull_regression_intercept := env_intercept
         bull_A_bar := array.first(bull_pivot_b)
-        bull_A_price := icpt + slp * bull_A_bar
+        bull_A_price := env_intercept + slp * bull_A_bar
         bull_B_bar := array.last(bull_pivot_b)
-        bull_B_price := icpt + slp * bull_B_bar
+        bull_B_price := env_intercept + slp * bull_B_bar
         touches = 0
         for i = 0 to array.size(bull_pivot_l) - 1
             xv = array.get(bull_pivot_b, i)
             yv = array.get(bull_pivot_l, i)
-            line_y = icpt + slp * xv
+            line_y = env_intercept + slp * xv
             if math.abs(yv - line_y) <= channel_touch_atr * atr14
                 touches := touches + 1
         bull_touches := touches
