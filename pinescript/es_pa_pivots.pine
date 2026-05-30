@@ -1,0 +1,215 @@
+//@version=5
+// ES PA Pivots - Brooks-style pivot + trend-state indicator
+// ============================================================================
+// Standalone visual-only indicator. Mirrors python/channels_yahoo_test.py:
+//   1. Williams fractal at strength N (default 2) + strict H/L alternation
+//      (collapse same-kind runs to the more extreme pivot).
+//   2. Trend-state state machine on the alternated stream:
+//      UNK / UP / DOWN / PEND_UP / PEND_DOWN
+//      - UP -> DOWN: needs LL that breaks the prior HL by >= min_break_atr*ATR,
+//        AND a confirming LH.
+//      - DOWN -> UP: needs HH breaking prior LH by same threshold, AND HL.
+//      - On confirmation, trend extreme is retroactively marked BLACK.
+//   3. Display convention:
+//      - BLACK arrow at trend-switch pivots
+//      - GREEN up-arrow at LOWs during UP trend
+//      - RED down-arrow at HIGHs during DOWN trend
+//      - Wrong-kind pivots hidden via transparent color
+//
+// Validation: /ES 2m 5/29 RTH -> 5 BLACK at ~10:00 / 10:44 / 12:40 / 14:00 / 15:42
+// ============================================================================
+
+indicator("ES PA Pivots", overlay=true, max_labels_count=500)
+
+// Inputs ---------------------------------------------------------------------
+strength      = input.int(2,   "Pivot strength (bars each side)", minval=1, maxval=10, group="Pivot")
+min_break_atr = input.float(0.5, "Reversal break (xATR)", minval=0.0, maxval=3.0, step=0.05, tooltip="LL must undercut prior HL (or HH overshoot prior LH) by this many ATRs to trigger reversal. 0 = any structural break.", group="Trend state")
+show_black    = input.bool(true,  "Show BLACK trend-switch arrows",  group="Display")
+show_green    = input.bool(true,  "Show GREEN HL/HH lows in uptrend", group="Display")
+show_red      = input.bool(true,  "Show RED LH/LL highs in downtrend", group="Display")
+show_ema      = input.bool(true,  "Show EMA21", group="Display")
+ema_length    = input.int(21, "EMA length", minval=5, maxval=200, group="Display")
+
+// ATR + EMA -----------------------------------------------------------------
+atr14 = ta.atr(14)
+ema21 = ta.ema(close, ema_length)
+plot(show_ema ? ema21 : na, "EMA", color=color.blue, linewidth=1)
+
+// Fractal candidates --------------------------------------------------------
+ph_cand = ta.pivothigh(high, strength, strength)
+pl_cand = ta.pivotlow(low,  strength, strength)
+new_ph = not na(ph_cand)
+new_pl = not na(pl_cand)
+piv_bar = bar_index - strength
+
+// Alternated pivot stream ---------------------------------------------------
+var array<float> piv_p   = array.new<float>(0)
+var array<int>   piv_b   = array.new<int>(0)
+var array<int>   piv_t   = array.new<int>(0)
+var array<label> piv_lab = array.new<label>(0)
+
+// Trend state ---------------------------------------------------------------
+// 0=UNK, 1=UP, 2=DOWN, 3=PEND_UP, 4=PEND_DOWN
+var int   tstate       = 0
+var float last_h_price = na
+var float last_l_price = na
+var float extreme_h_p  = na
+var int   extreme_h_i  = na
+var float extreme_l_p  = na
+var int   extreme_l_i  = na
+var float last_HL_p    = na
+var float last_LH_p    = na
+
+// Display helpers ------------------------------------------------------------
+arrow_color(kind, struct_lab) =>
+    out_c = color.gray
+    if struct_lab == "BLACK"
+        out_c := color.black
+    else if kind == 1 and (struct_lab == "LH" or struct_lab == "LL")
+        out_c := color.red
+    else if kind == -1 and (struct_lab == "HL" or struct_lab == "HH")
+        out_c := color.green
+    out_c
+
+arrow_style(kind) =>
+    kind == 1 ? label.style_arrowdown : label.style_arrowup
+
+should_show(kind, struct_lab) =>
+    out = false
+    if struct_lab == "BLACK"
+        out := show_black
+    else if kind == 1 and (struct_lab == "LH" or struct_lab == "LL")
+        out := show_red
+    else if kind == -1 and (struct_lab == "HL" or struct_lab == "HH")
+        out := show_green
+    out
+
+// Always create a label so we can update it later. If the pivot shouldn't be
+// visible (per show toggles), use a fully transparent color.
+make_label_for(x, y, kind, struct_lab) =>
+    c_visible = arrow_color(kind, struct_lab)
+    show = should_show(kind, struct_lab)
+    c_final = show ? c_visible : color.new(color.gray, 100)
+    label.new(x, y, "", color=c_final, style=arrow_style(kind), textcolor=c_final, size=size.tiny)
+
+// Push a new pivot or replace the last same-kind extreme. Returns the array
+// index of the resulting pivot, or -1 if push was skipped.
+push_alt(p, b, kind) =>
+    n = array.size(piv_t)
+    out_idx = -1
+    if n == 0
+        array.push(piv_p, p)
+        array.push(piv_b, b)
+        array.push(piv_t, kind)
+        out_idx := array.size(piv_t) - 1
+    else
+        last_kind = array.last(piv_t)
+        if last_kind == kind
+            last_p = array.last(piv_p)
+            replace = (kind == 1 and p > last_p) or (kind == -1 and p < last_p)
+            if replace
+                last_i = array.size(piv_p) - 1
+                old_lab = array.get(piv_lab, last_i)
+                label.delete(old_lab)
+                array.pop(piv_lab)
+                array.set(piv_p, last_i, p)
+                array.set(piv_b, last_i, b)
+                out_idx := last_i
+        else
+            array.push(piv_p, p)
+            array.push(piv_b, b)
+            array.push(piv_t, kind)
+            out_idx := array.size(piv_t) - 1
+    out_idx
+
+mark_black(arr_idx, kind) =>
+    if arr_idx >= 0
+        if arr_idx < array.size(piv_lab)
+            old_lab = array.get(piv_lab, arr_idx)
+            label.delete(old_lab)
+            bx = array.get(piv_b, arr_idx)
+            by = array.get(piv_p, arr_idx)
+            new_lab = make_label_for(bx, by, kind, "BLACK")
+            array.set(piv_lab, arr_idx, new_lab)
+
+// === On new HIGH pivot =====================================================
+if new_ph
+    idx_h = push_alt(ph_cand, piv_bar, 1)
+    if idx_h >= 0
+        struct_h = na(last_h_price) ? "UNK" : (ph_cand > last_h_price ? "HH" : "LH")
+        // Track extreme H
+        if na(extreme_h_p)
+            extreme_h_p := ph_cand
+            extreme_h_i := idx_h
+        else if ph_cand > extreme_h_p
+            extreme_h_p := ph_cand
+            extreme_h_i := idx_h
+        last_h_price := ph_cand
+        if struct_h == "LH"
+            last_LH_p := ph_cand
+        thr_h = na(atr14) ? 0.0 : atr14 * min_break_atr
+        // State transitions
+        if tstate == 2 and struct_h == "HH"
+            strong_up = na(last_LH_p) or (ph_cand - last_LH_p) >= thr_h
+            if strong_up
+                tstate := 3
+        else if tstate == 4 and struct_h == "LH"
+            // PEND_DOWN -> DOWN: mark prior extreme H as BLACK
+            if not na(extreme_h_i)
+                if extreme_h_i != idx_h
+                    mark_black(extreme_h_i, 1)
+            tstate := 2
+            extreme_h_p := na
+            extreme_h_i := na
+            last_HL_p := na
+            last_LH_p := ph_cand
+        else if tstate == 3 and struct_h == "LH"
+            tstate := 2
+        else if tstate == 0 and struct_h == "HH"
+            tstate := 1
+        // Place initial label for this pivot
+        new_lab_h = make_label_for(piv_bar, ph_cand, 1, struct_h)
+        array.push(piv_lab, new_lab_h)
+
+// === On new LOW pivot ======================================================
+if new_pl
+    idx_l = push_alt(pl_cand, piv_bar, -1)
+    if idx_l >= 0
+        struct_l = na(last_l_price) ? "UNK" : (pl_cand < last_l_price ? "LL" : "HL")
+        if na(extreme_l_p)
+            extreme_l_p := pl_cand
+            extreme_l_i := idx_l
+        else if pl_cand < extreme_l_p
+            extreme_l_p := pl_cand
+            extreme_l_i := idx_l
+        last_l_price := pl_cand
+        if struct_l == "HL"
+            last_HL_p := pl_cand
+        thr_l = na(atr14) ? 0.0 : atr14 * min_break_atr
+        if tstate == 1 and struct_l == "LL"
+            strong_dn = na(last_HL_p) or (last_HL_p - pl_cand) >= thr_l
+            if strong_dn
+                tstate := 4
+        else if tstate == 3 and struct_l == "HL"
+            // PEND_UP -> UP: mark prior extreme L as BLACK
+            if not na(extreme_l_i)
+                if extreme_l_i != idx_l
+                    mark_black(extreme_l_i, -1)
+            tstate := 1
+            extreme_l_p := na
+            extreme_l_i := na
+            last_LH_p := na
+            last_HL_p := pl_cand
+        else if tstate == 4 and struct_l == "HL"
+            tstate := 1
+        else if tstate == 0 and struct_l == "LL"
+            tstate := 2
+        new_lab_l = make_label_for(piv_bar, pl_cand, -1, struct_l)
+        array.push(piv_lab, new_lab_l)
+
+// === Right-edge status =====================================================
+var label status_lab = na
+if barstate.islast
+    state_s = tstate == 0 ? "UNK" : (tstate == 1 ? "UP" : (tstate == 2 ? "DOWN" : (tstate == 3 ? "PEND_UP" : "PEND_DOWN")))
+    label.delete(status_lab)
+    status_lab := label.new(bar_index + 2, close, "Trend: " + state_s + "  Pivots: " + str.tostring(array.size(piv_t)), color=color.new(color.silver, 70), textcolor=color.black, style=label.style_label_left, size=size.normal)
