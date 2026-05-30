@@ -593,7 +593,7 @@ The course distributes Uptrend rules and Downtrend rules as two separate slide d
 
 The implementation reflects this:
 
-- Every `BULL_TREND` branch in engine.py / ESPriceAction.cs / es_priceaction.pine /
+- Every `BULL_TREND` branch in engine.py / ESPriceAction.cs / es_pa_strategy.pine /
   es_priceaction.ts has an equivalent `BEAR_TREND` branch.
 - Every 2EL/F2EL/FB_LONG/HLLH_LONG detector has a 2ES/F2ES/FB_SHORT/HLLH_SHORT mirror.
 - The new-extreme cooldown (§13.5.4) tracks fresh highs AND fresh lows independently.
