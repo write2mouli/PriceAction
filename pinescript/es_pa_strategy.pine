@@ -308,110 +308,213 @@ if fire_2ES
     p_short_target := target_mode == "fixed_1pt" ? (p_short_entry - 4 * tick_sz) : target_mode == "fixed_2pt" ? (p_short_entry - 8 * tick_sz) : bear_swing_low
 
 // ============================================================================
-// Channel detection + overshoot filter
+// Channel detection (Brooks/Grimes leg-scoped, sticky)
 // ----------------------------------------------------------------------------
-// Bear channel: 2 most recent descending pivot-highs define the upper line;
-// parallel line through the most recent pivot-low between/around them.
-// Overshoot ABOVE the upper line by N ticks -> expect consolidation/reversal
-// -> block 2ES for the next N bars.
-// Bull channel: mirror; overshoot BELOW lower line blocks 2EL.
+// Anchors are FROZEN once a channel forms. Anchor A = first qualifying pivot
+// of the leg; Anchor B = current best (only replaced by a more prominent
+// pivot that further extends the trend). Channel persists until price closes
+// through the TRENDLINE (near side) by N ATRs - the breakout. A poke of the
+// TCL (far side, parallel line) is an OVERSHOOT - climactic reversal signal,
+// NOT invalidation. This matches how Brooks holds his manually drawn lines.
+//
+// Bear channel:
+//   Trendline (NEAR / upper) = line through 2 descending qualifying PHs
+//   TCL (FAR / lower)        = parallel line through deepest PL between anchors
+//   Breakout (invalidates)   = close > Trendline + breakout_atr * ATR
+//   Overshoot (signal)       = low < TCL - overshoot_atr * ATR
+//
+// Bull channel: mirror.
 // ============================================================================
-channel_overshoot_ticks  = input.int(4,  "Channel overshoot threshold (ticks)", minval=0, maxval=40, group="06 Channel filter")
-channel_block_bars       = input.int(20, "Block opposite trades after overshoot (bars)", minval=1, maxval=100, group="06 Channel filter")
-enable_channel_filter    = input.bool(true, "Enable channel overshoot filter", group="06 Channel filter")
-draw_channels            = input.bool(true, "Draw active channel lines", group="06 Channel filter")
-channel_pivot_strength   = input.int(3,  "Channel pivot strength", minval=1, maxval=10, group="06 Channel filter")
+channel_overshoot_atr     = input.float(0.25, "Channel overshoot threshold (xATR)", minval=0.05, maxval=2.0, step=0.05, group="06 Channel filter")
+channel_breakout_atr      = input.float(0.25, "Channel breakout threshold (xATR)",  minval=0.05, maxval=2.0, step=0.05, group="06 Channel filter")
+channel_block_bars        = input.int(30, "Block opposite trades after overshoot (bars)", minval=1, maxval=200, group="06 Channel filter")
+channel_pivot_prominence  = input.float(0.5, "Min pivot prominence (xATR from EMA)", minval=0.0, maxval=3.0, step=0.1, tooltip="Pivot must be at least this many ATRs away from EMA21 to qualify. Filters out micro-pivots in consolidation.", group="06 Channel filter")
+enable_channel_filter     = input.bool(true, "Enable channel overshoot filter", group="06 Channel filter")
+draw_channels             = input.bool(true, "Draw active channel lines", group="06 Channel filter")
+channel_pivot_strength    = input.int(3,  "Channel pivot strength (bars)", minval=1, maxval=10, group="06 Channel filter")
 
+atr14 = ta.atr(14)
 ph = ta.pivothigh(high, channel_pivot_strength, channel_pivot_strength)
 pl = ta.pivotlow(low,  channel_pivot_strength, channel_pivot_strength)
 
-var float ph1 = na
-var int   ph1_bar = na   // most recent confirmed pivot high
-var float ph2 = na
-var int   ph2_bar = na   // prior
-var float pl1 = na
-var int   pl1_bar = na
-var float pl2 = na
-var int   pl2_bar = na
+// Pivot prominence (distance from EMA at pivot bar)
+ph_prom = not na(ph) ? math.abs(ph - ema21[channel_pivot_strength]) : 0.0
+pl_prom = not na(pl) ? math.abs(pl - ema21[channel_pivot_strength]) : 0.0
+prom_threshold = channel_pivot_prominence * atr14[channel_pivot_strength]
+ph_qualifies = not na(ph) and ph_prom >= prom_threshold
+pl_qualifies = not na(pl) and pl_prom >= prom_threshold
 
-if not na(ph)
-    ph2 := ph1
-    ph2_bar := ph1_bar
-    ph1 := ph
-    ph1_bar := bar_index - channel_pivot_strength
-if not na(pl)
-    pl2 := pl1
-    pl2_bar := pl1_bar
-    pl1 := pl
-    pl1_bar := bar_index - channel_pivot_strength
+// ---- Bear channel state ----
+var float bear_A_price = na
+var int   bear_A_bar = na
+var float bear_A_prom = na
+var float bear_B_price = na
+var int   bear_B_bar = na
+var float bear_B_prom = na
+var float bear_C_price = na   // TCL anchor (lowest PL between anchors)
+var int   bear_C_bar = na
+var bool  bear_channel_active = false
 
-// ---- Bear channel: 2 descending pivot highs ----
-bear_ch_valid = not na(ph1) and not na(ph2) and ph1 < ph2 and not na(ph1_bar) and not na(ph2_bar) and ph1_bar > ph2_bar
-bear_ch_slope = bear_ch_valid ? (ph1 - ph2) / (ph1_bar - ph2_bar) : 0.0
-// Anchor lower line at most recent pivot-low that sits BETWEEN ph2_bar and the current bar
-bear_ch_anchor_low = bear_ch_valid and not na(pl1) and pl1_bar > ph2_bar ? pl1 : na
-bear_ch_anchor_bar = bear_ch_valid and not na(pl1) and pl1_bar > ph2_bar ? pl1_bar : na
-bear_ch_top_at(b) => bear_ch_valid ? ph2 + bear_ch_slope * (b - ph2_bar) : na
-bear_ch_bot_at(b) => bear_ch_valid and not na(bear_ch_anchor_low) ? bear_ch_anchor_low + bear_ch_slope * (b - bear_ch_anchor_bar) : na
-bear_ch_overshoot = bear_ch_valid and not na(bear_ch_top_at(bar_index)) and close > bear_ch_top_at(bar_index) + channel_overshoot_ticks * tick_sz
+// ---- Bull channel state ----
+var float bull_A_price = na
+var int   bull_A_bar = na
+var float bull_A_prom = na
+var float bull_B_price = na
+var int   bull_B_bar = na
+var float bull_B_prom = na
+var float bull_C_price = na   // TCL anchor (highest PH between anchors)
+var int   bull_C_bar = na
+var bool  bull_channel_active = false
 
-// ---- Bull channel: 2 ascending pivot lows ----
-bull_ch_valid = not na(pl1) and not na(pl2) and pl1 > pl2 and not na(pl1_bar) and not na(pl2_bar) and pl1_bar > pl2_bar
-bull_ch_slope = bull_ch_valid ? (pl1 - pl2) / (pl1_bar - pl2_bar) : 0.0
-bull_ch_anchor_high = bull_ch_valid and not na(ph1) and ph1_bar > pl2_bar ? ph1 : na
-bull_ch_anchor_bar  = bull_ch_valid and not na(ph1) and ph1_bar > pl2_bar ? ph1_bar : na
-bull_ch_bot_at(b) => bull_ch_valid ? pl2 + bull_ch_slope * (b - pl2_bar) : na
-bull_ch_top_at(b) => bull_ch_valid and not na(bull_ch_anchor_high) ? bull_ch_anchor_high + bull_ch_slope * (b - bull_ch_anchor_bar) : na
-bull_ch_overshoot = bull_ch_valid and not na(bull_ch_bot_at(bar_index)) and close < bull_ch_bot_at(bar_index) - channel_overshoot_ticks * tick_sz
+// ---- Bear channel formation ----
+if ph_qualifies
+    ph_value = high[channel_pivot_strength]
+    ph_bar   = bar_index - channel_pivot_strength
+    if not bear_channel_active
+        if na(bear_A_price)
+            bear_A_price := ph_value
+            bear_A_bar   := ph_bar
+            bear_A_prom  := ph_prom
+        else if ph_value < bear_A_price
+            // 2nd descending qualifying PH -> activate channel
+            bear_B_price := ph_value
+            bear_B_bar   := ph_bar
+            bear_B_prom  := ph_prom
+            bear_channel_active := true
+        else
+            // Higher than A -> new leg starting; A moves up
+            bear_A_price := ph_value
+            bear_A_bar   := ph_bar
+            bear_A_prom  := ph_prom
+    else
+        // Channel active - only replace B by improvement (lower AND more prominent)
+        if ph_value < bear_B_price and ph_prom > bear_B_prom
+            bear_B_price := ph_value
+            bear_B_bar   := ph_bar
+            bear_B_prom  := ph_prom
 
-// ---- Track overshoot recency ----
+// Bear TCL anchor (deepest qualifying PL after anchor A)
+if pl_qualifies and bear_channel_active
+    pl_value = low[channel_pivot_strength]
+    pl_bar   = bar_index - channel_pivot_strength
+    if pl_bar > bear_A_bar and (na(bear_C_price) or pl_value < bear_C_price)
+        bear_C_price := pl_value
+        bear_C_bar   := pl_bar
+
+// ---- Bull channel formation (mirror) ----
+if pl_qualifies
+    pl_value = low[channel_pivot_strength]
+    pl_bar   = bar_index - channel_pivot_strength
+    if not bull_channel_active
+        if na(bull_A_price)
+            bull_A_price := pl_value
+            bull_A_bar   := pl_bar
+            bull_A_prom  := pl_prom
+        else if pl_value > bull_A_price
+            bull_B_price := pl_value
+            bull_B_bar   := pl_bar
+            bull_B_prom  := pl_prom
+            bull_channel_active := true
+        else
+            bull_A_price := pl_value
+            bull_A_bar   := pl_bar
+            bull_A_prom  := pl_prom
+    else
+        if pl_value > bull_B_price and pl_prom > bull_B_prom
+            bull_B_price := pl_value
+            bull_B_bar   := pl_bar
+            bull_B_prom  := pl_prom
+
+if ph_qualifies and bull_channel_active
+    ph_value = high[channel_pivot_strength]
+    ph_bar   = bar_index - channel_pivot_strength
+    if ph_bar > bull_A_bar and (na(bull_C_price) or ph_value > bull_C_price)
+        bull_C_price := ph_value
+        bull_C_bar   := ph_bar
+
+// ---- Channel line equations ----
+bear_slope = bear_channel_active and not na(bear_A_bar) and not na(bear_B_bar) and bear_B_bar > bear_A_bar ? (bear_B_price - bear_A_price) / (bear_B_bar - bear_A_bar) : 0.0
+bear_trendline_at(b) => bear_channel_active ? bear_A_price + bear_slope * (b - bear_A_bar) : na
+bear_tcl_at(b) => bear_channel_active and not na(bear_C_price) ? bear_C_price + bear_slope * (b - bear_C_bar) : na
+
+bull_slope = bull_channel_active and not na(bull_A_bar) and not na(bull_B_bar) and bull_B_bar > bull_A_bar ? (bull_B_price - bull_A_price) / (bull_B_bar - bull_A_bar) : 0.0
+bull_trendline_at(b) => bull_channel_active ? bull_A_price + bull_slope * (b - bull_A_bar) : na
+bull_tcl_at(b) => bull_channel_active and not na(bull_C_price) ? bull_C_price + bull_slope * (b - bull_C_bar) : na
+
+// ---- Channel invalidation (close through TRENDLINE = near side) ----
+bear_trendline_now = bear_trendline_at(bar_index)
+bull_trendline_now = bull_trendline_at(bar_index)
+bear_breakout = bear_channel_active and not na(bear_trendline_now) and close > bear_trendline_now + channel_breakout_atr * atr14
+bull_breakout = bull_channel_active and not na(bull_trendline_now) and close < bull_trendline_now - channel_breakout_atr * atr14
+
+if bear_breakout
+    bear_channel_active := false
+    bear_A_price := na
+    bear_B_price := na
+    bear_C_price := na
+if bull_breakout
+    bull_channel_active := false
+    bull_A_price := na
+    bull_B_price := na
+    bull_C_price := na
+
+// ---- Overshoot detection (poke through TCL = far side) ----
+bear_tcl_now = bear_tcl_at(bar_index)
+bull_tcl_now = bull_tcl_at(bar_index)
+bear_overshoot = bear_channel_active and not na(bear_tcl_now) and low < bear_tcl_now - channel_overshoot_atr * atr14
+bull_overshoot = bull_channel_active and not na(bull_tcl_now) and high > bull_tcl_now + channel_overshoot_atr * atr14
+
+// ---- Post-overshoot window ----
 var int last_bear_overshoot_bar = na
 var int last_bull_overshoot_bar = na
-if bear_ch_overshoot
+if bear_overshoot
     last_bear_overshoot_bar := bar_index
-if bull_ch_overshoot
+if bull_overshoot
     last_bull_overshoot_bar := bar_index
 
 in_bear_post_overshoot = enable_channel_filter and not na(last_bear_overshoot_bar) and bar_index - last_bear_overshoot_bar < channel_block_bars
 in_bull_post_overshoot = enable_channel_filter and not na(last_bull_overshoot_bar) and bar_index - last_bull_overshoot_bar < channel_block_bars
 
-// ---- Draw active channel lines (refreshed on last bar) ----
-var line bear_ch_top_line = na
-var line bear_ch_bot_line = na
-var line bull_ch_top_line = na
-var line bull_ch_bot_line = na
+// ---- Draw active channel lines ----
+var line bear_tl_line  = na
+var line bear_tcl_line = na
+var line bull_tl_line  = na
+var line bull_tcl_line = na
 
 if draw_channels and barstate.islast
-    if bear_ch_valid and not na(bear_ch_anchor_low)
-        if not na(bear_ch_top_line)
-            line.delete(bear_ch_top_line)
-        if not na(bear_ch_bot_line)
-            line.delete(bear_ch_bot_line)
+    if bear_channel_active
+        if not na(bear_tl_line)
+            line.delete(bear_tl_line)
+        if not na(bear_tcl_line)
+            line.delete(bear_tcl_line)
         right_x = bar_index + 10
         ch_color = in_bear_post_overshoot ? color.orange : color.red
-        bear_ch_top_line := line.new(ph2_bar, ph2, right_x, bear_ch_top_at(right_x), color=ch_color, width=2)
-        bear_ch_bot_line := line.new(bear_ch_anchor_bar, bear_ch_anchor_low, right_x, bear_ch_bot_at(right_x), color=ch_color, width=2, style=line.style_dashed)
-    if bull_ch_valid and not na(bull_ch_anchor_high)
-        if not na(bull_ch_top_line)
-            line.delete(bull_ch_top_line)
-        if not na(bull_ch_bot_line)
-            line.delete(bull_ch_bot_line)
+        bear_tl_line := line.new(bear_A_bar, bear_A_price, right_x, bear_trendline_at(right_x), color=ch_color, width=2)
+        if not na(bear_C_price)
+            bear_tcl_line := line.new(bear_C_bar, bear_C_price, right_x, bear_tcl_at(right_x), color=ch_color, width=2, style=line.style_dashed)
+    if bull_channel_active
+        if not na(bull_tl_line)
+            line.delete(bull_tl_line)
+        if not na(bull_tcl_line)
+            line.delete(bull_tcl_line)
         right_x = bar_index + 10
         ch_color = in_bull_post_overshoot ? color.orange : color.green
-        bull_ch_top_line := line.new(bull_ch_anchor_bar, bull_ch_anchor_high, right_x, bull_ch_top_at(right_x), color=ch_color, width=2, style=line.style_dashed)
-        bull_ch_bot_line := line.new(pl2_bar, pl2, right_x, bull_ch_bot_at(right_x), color=ch_color, width=2)
+        bull_tl_line := line.new(bull_A_bar, bull_A_price, right_x, bull_trendline_at(right_x), color=ch_color, width=2)
+        if not na(bull_C_price)
+            bull_tcl_line := line.new(bull_C_bar, bull_C_price, right_x, bull_tcl_at(right_x), color=ch_color, width=2, style=line.style_dashed)
 
-// ---- Diagnostic status label (top-right) ----
+// ---- Diagnostic status label ----
 var label channel_status_label = na
 if draw_channels and barstate.islast
     if not na(channel_status_label)
         label.delete(channel_status_label)
-    bear_state_text = bear_ch_valid ? (in_bear_post_overshoot ? "BEAR-OVERSHOT" : "BEAR-ACTIVE") : "BEAR-none"
-    bull_state_text = bull_ch_valid ? (in_bull_post_overshoot ? "BULL-OVERSHOT" : "BULL-ACTIVE") : "BULL-none"
-    ph_text = "PH1=" + (na(ph1) ? "-" : str.tostring(ph1, "#.##")) + " (b" + (na(ph1_bar) ? "-" : str.tostring(bar_index - ph1_bar)) + " ago)  PH2=" + (na(ph2) ? "-" : str.tostring(ph2, "#.##")) + " (b" + (na(ph2_bar) ? "-" : str.tostring(bar_index - ph2_bar)) + " ago)"
-    pl_text = "PL1=" + (na(pl1) ? "-" : str.tostring(pl1, "#.##")) + " (b" + (na(pl1_bar) ? "-" : str.tostring(bar_index - pl1_bar)) + " ago)  PL2=" + (na(pl2) ? "-" : str.tostring(pl2, "#.##")) + " (b" + (na(pl2_bar) ? "-" : str.tostring(bar_index - pl2_bar)) + " ago)"
-    status_text = "Channel: " + bear_state_text + " | " + bull_state_text + "\n" + ph_text + "\n" + pl_text
-    channel_status_label := label.new(bar_index, high, status_text, color=color.new(color.black, 30), textcolor=color.white, style=label.style_label_left, xloc=xloc.bar_index, size=size.normal)
+    bear_state_text = bear_channel_active ? (in_bear_post_overshoot ? "BEAR-OVERSHOT(" + str.tostring(bar_index - last_bear_overshoot_bar) + "b)" : "BEAR-ACTIVE") : (na(bear_A_price) ? "BEAR-none" : "BEAR-waiting-B")
+    bull_state_text = bull_channel_active ? (in_bull_post_overshoot ? "BULL-OVERSHOT(" + str.tostring(bar_index - last_bull_overshoot_bar) + "b)" : "BULL-ACTIVE") : (na(bull_A_price) ? "BULL-none" : "BULL-waiting-B")
+    bear_anchors = "Bear A=" + (na(bear_A_price) ? "-" : str.tostring(bear_A_price, "#.##") + "@b" + str.tostring(bar_index - bear_A_bar)) + "  B=" + (na(bear_B_price) ? "-" : str.tostring(bear_B_price, "#.##") + "@b" + str.tostring(bar_index - bear_B_bar)) + "  C=" + (na(bear_C_price) ? "-" : str.tostring(bear_C_price, "#.##") + "@b" + str.tostring(bar_index - bear_C_bar))
+    bull_anchors = "Bull A=" + (na(bull_A_price) ? "-" : str.tostring(bull_A_price, "#.##") + "@b" + str.tostring(bar_index - bull_A_bar)) + "  B=" + (na(bull_B_price) ? "-" : str.tostring(bull_B_price, "#.##") + "@b" + str.tostring(bar_index - bull_B_bar)) + "  C=" + (na(bull_C_price) ? "-" : str.tostring(bull_C_price, "#.##") + "@b" + str.tostring(bar_index - bull_C_bar))
+    atr_text = "ATR=" + str.tostring(atr14, "#.##") + "  prom>=" + str.tostring(prom_threshold, "#.##")
+    status_text = bear_state_text + " | " + bull_state_text + "\n" + bear_anchors + "\n" + bull_anchors + "\n" + atr_text
+    channel_status_label := label.new(bar_index, high, status_text, color=color.new(color.black, 20), textcolor=color.white, style=label.style_label_left, xloc=xloc.bar_index, size=size.normal)
 
 // ============================================================================
 // Helpers
