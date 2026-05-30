@@ -30,7 +30,9 @@ show_green    = input.bool(true,  "Show GREEN HL/HH lows in uptrend",  group="Di
 show_red      = input.bool(true,  "Show RED LH/LL highs in downtrend", group="Display")
 show_ema      = input.bool(true,  "Show EMA21", group="Display")
 ema_length    = input.int(21, "EMA length", minval=5, maxval=200, group="Display")
+arrow_size_in = input.string("normal", "Arrow size", options=["tiny","small","normal","large","huge"], tooltip="Fixed pixel size (doesn't scale with chart zoom). 'huge' is biggest.", group="Display")
 black_marker_height_atr = input.float(0.4, "BLACK marker height (xATR)", minval=0.05, maxval=2.0, step=0.05, group="Display")
+black_marker_width = input.int(3, "BLACK marker line width", minval=1, maxval=8, group="Display")
 
 // ATR + EMA -----------------------------------------------------------------
 atr14 = ta.atr(14)
@@ -103,7 +105,7 @@ draw_black(arr_idx, kind) =>
             y_top    = kind == 1 ? bp + ah : bp
             y_bottom = kind == 1 ? bp      : bp - ah
             if show_black
-                line.new(bx, y_bottom, bx, y_top, color=color.black, width=3, style=line.style_solid)
+                line.new(bx, y_bottom, bx, y_top, color=color.black, width=black_marker_width, style=line.style_solid)
 
 // === On new HIGH pivot =====================================================
 if new_ph
@@ -190,8 +192,12 @@ if new_pl
 green_y = this_bar_green and show_green ? pl_cand : na
 red_y   = this_bar_red   and show_red   ? ph_cand : na
 
-plotshape(green_y, "GREEN low (uptrend)", style=shape.arrowup, location=location.absolute, color=color.green, size=size.small, offset=-strength)
-plotshape(red_y,   "RED high (downtrend)", style=shape.arrowdown, location=location.absolute, color=color.red, size=size.small, offset=-strength)
+// Map the string input to a Pine size constant. plotshape requires a
+// CONST size argument, so we can't pass a series -- use a ternary chain.
+arrow_size_const = arrow_size_in == "tiny" ? size.tiny : arrow_size_in == "small" ? size.small : arrow_size_in == "large" ? size.large : arrow_size_in == "huge" ? size.huge : size.normal
+
+plotshape(green_y, "GREEN low (uptrend)", style=shape.arrowup, location=location.absolute, color=color.green, size=arrow_size_const, offset=-strength)
+plotshape(red_y,   "RED high (downtrend)", style=shape.arrowdown, location=location.absolute, color=color.red, size=arrow_size_const, offset=-strength)
 
 // === Status table (viewport-anchored, doesn't move with chart pan) =========
 var table status_tbl = table.new(position.top_right, 2, 2, bgcolor=color.new(color.gray, 80), border_width=1)
