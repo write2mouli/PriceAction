@@ -308,6 +308,100 @@ if fire_2ES
     p_short_target := target_mode == "fixed_1pt" ? (p_short_entry - 4 * tick_sz) : target_mode == "fixed_2pt" ? (p_short_entry - 8 * tick_sz) : bear_swing_low
 
 // ============================================================================
+// Channel detection + overshoot filter
+// ----------------------------------------------------------------------------
+// Bear channel: 2 most recent descending pivot-highs define the upper line;
+// parallel line through the most recent pivot-low between/around them.
+// Overshoot ABOVE the upper line by N ticks -> expect consolidation/reversal
+// -> block 2ES for the next N bars.
+// Bull channel: mirror; overshoot BELOW lower line blocks 2EL.
+// ============================================================================
+channel_overshoot_ticks  = input.int(4,  "Channel overshoot threshold (ticks)", minval=0, maxval=40, group="06 Channel filter")
+channel_block_bars       = input.int(20, "Block opposite trades after overshoot (bars)", minval=1, maxval=100, group="06 Channel filter")
+enable_channel_filter    = input.bool(true, "Enable channel overshoot filter", group="06 Channel filter")
+draw_channels            = input.bool(true, "Draw active channel lines", group="06 Channel filter")
+channel_pivot_strength   = input.int(3,  "Channel pivot strength", minval=1, maxval=10, group="06 Channel filter")
+
+ph = ta.pivothigh(high, channel_pivot_strength, channel_pivot_strength)
+pl = ta.pivotlow(low,  channel_pivot_strength, channel_pivot_strength)
+
+var float ph1 = na
+var int   ph1_bar = na   // most recent confirmed pivot high
+var float ph2 = na
+var int   ph2_bar = na   // prior
+var float pl1 = na
+var int   pl1_bar = na
+var float pl2 = na
+var int   pl2_bar = na
+
+if not na(ph)
+    ph2 := ph1
+    ph2_bar := ph1_bar
+    ph1 := ph
+    ph1_bar := bar_index - channel_pivot_strength
+if not na(pl)
+    pl2 := pl1
+    pl2_bar := pl1_bar
+    pl1 := pl
+    pl1_bar := bar_index - channel_pivot_strength
+
+// ---- Bear channel: 2 descending pivot highs ----
+bear_ch_valid = not na(ph1) and not na(ph2) and ph1 < ph2 and not na(ph1_bar) and not na(ph2_bar) and ph1_bar > ph2_bar
+bear_ch_slope = bear_ch_valid ? (ph1 - ph2) / (ph1_bar - ph2_bar) : 0.0
+// Anchor lower line at most recent pivot-low that sits BETWEEN ph2_bar and the current bar
+bear_ch_anchor_low = bear_ch_valid and not na(pl1) and pl1_bar > ph2_bar ? pl1 : na
+bear_ch_anchor_bar = bear_ch_valid and not na(pl1) and pl1_bar > ph2_bar ? pl1_bar : na
+bear_ch_top_at(b) => bear_ch_valid ? ph2 + bear_ch_slope * (b - ph2_bar) : na
+bear_ch_bot_at(b) => bear_ch_valid and not na(bear_ch_anchor_low) ? bear_ch_anchor_low + bear_ch_slope * (b - bear_ch_anchor_bar) : na
+bear_ch_overshoot = bear_ch_valid and not na(bear_ch_top_at(bar_index)) and close > bear_ch_top_at(bar_index) + channel_overshoot_ticks * tick_sz
+
+// ---- Bull channel: 2 ascending pivot lows ----
+bull_ch_valid = not na(pl1) and not na(pl2) and pl1 > pl2 and not na(pl1_bar) and not na(pl2_bar) and pl1_bar > pl2_bar
+bull_ch_slope = bull_ch_valid ? (pl1 - pl2) / (pl1_bar - pl2_bar) : 0.0
+bull_ch_anchor_high = bull_ch_valid and not na(ph1) and ph1_bar > pl2_bar ? ph1 : na
+bull_ch_anchor_bar  = bull_ch_valid and not na(ph1) and ph1_bar > pl2_bar ? ph1_bar : na
+bull_ch_bot_at(b) => bull_ch_valid ? pl2 + bull_ch_slope * (b - pl2_bar) : na
+bull_ch_top_at(b) => bull_ch_valid and not na(bull_ch_anchor_high) ? bull_ch_anchor_high + bull_ch_slope * (b - bull_ch_anchor_bar) : na
+bull_ch_overshoot = bull_ch_valid and not na(bull_ch_bot_at(bar_index)) and close < bull_ch_bot_at(bar_index) - channel_overshoot_ticks * tick_sz
+
+// ---- Track overshoot recency ----
+var int last_bear_overshoot_bar = na
+var int last_bull_overshoot_bar = na
+if bear_ch_overshoot
+    last_bear_overshoot_bar := bar_index
+if bull_ch_overshoot
+    last_bull_overshoot_bar := bar_index
+
+in_bear_post_overshoot = enable_channel_filter and not na(last_bear_overshoot_bar) and bar_index - last_bear_overshoot_bar < channel_block_bars
+in_bull_post_overshoot = enable_channel_filter and not na(last_bull_overshoot_bar) and bar_index - last_bull_overshoot_bar < channel_block_bars
+
+// ---- Draw active channel lines (refreshed on last bar) ----
+var line bear_ch_top_line = na
+var line bear_ch_bot_line = na
+var line bull_ch_top_line = na
+var line bull_ch_bot_line = na
+
+if draw_channels and barstate.islast
+    if bear_ch_valid and not na(bear_ch_anchor_low)
+        if not na(bear_ch_top_line)
+            line.delete(bear_ch_top_line)
+        if not na(bear_ch_bot_line)
+            line.delete(bear_ch_bot_line)
+        right_x = bar_index + 10
+        ch_color = in_bear_post_overshoot ? color.new(color.orange, 30) : color.new(color.red, 50)
+        bear_ch_top_line := line.new(ph2_bar, ph2, right_x, bear_ch_top_at(right_x), color=ch_color, width=1)
+        bear_ch_bot_line := line.new(bear_ch_anchor_bar, bear_ch_anchor_low, right_x, bear_ch_bot_at(right_x), color=ch_color, width=1, style=line.style_dashed)
+    if bull_ch_valid and not na(bull_ch_anchor_high)
+        if not na(bull_ch_top_line)
+            line.delete(bull_ch_top_line)
+        if not na(bull_ch_bot_line)
+            line.delete(bull_ch_bot_line)
+        right_x = bar_index + 10
+        ch_color = in_bull_post_overshoot ? color.new(color.orange, 30) : color.new(color.green, 50)
+        bull_ch_top_line := line.new(bull_ch_anchor_bar, bull_ch_anchor_high, right_x, bull_ch_top_at(right_x), color=ch_color, width=1, style=line.style_dashed)
+        bull_ch_bot_line := line.new(pl2_bar, pl2, right_x, bull_ch_bot_at(right_x), color=ch_color, width=1)
+
+// ============================================================================
 // Helpers
 // ============================================================================
 grade_for(s) =>
@@ -327,8 +421,8 @@ color_for(s) =>
 var int pending_long_bar  = na
 var int pending_short_bar = na
 
-bull_setup_active = bull_state == 3 and bull_ema_touched and bull_depth_ok and bull_score >= min_quality_score and (not require_sig_bar or valid_long_sig) and allow_longs and in_session
-bear_setup_active = bear_state == 3 and bear_ema_touched and bear_depth_ok and bear_score >= min_quality_score and (not require_sig_bar or valid_short_sig) and allow_shorts and in_session
+bull_setup_active = bull_state == 3 and bull_ema_touched and bull_depth_ok and bull_score >= min_quality_score and (not require_sig_bar or valid_long_sig) and allow_longs and in_session and not in_bull_post_overshoot
+bear_setup_active = bear_state == 3 and bear_ema_touched and bear_depth_ok and bear_score >= min_quality_score and (not require_sig_bar or valid_short_sig) and allow_shorts and in_session and not in_bear_post_overshoot
 
 if bull_setup_active and strategy.position_size == 0
     p_long_entry  := high + tick_sz
