@@ -127,9 +127,9 @@ mark_black(arr_idx, kind) =>
         if arr_idx < array.size(piv_lab)
             old_lab = array.get(piv_lab, arr_idx)
             label.delete(old_lab)
-            bx = array.get(piv_b, arr_idx)
-            by = array.get(piv_p, arr_idx)
-            new_lab = make_label_for(bx, by, kind, "BLACK")
+            xv = array.get(piv_b, arr_idx)
+            yv = array.get(piv_p, arr_idx)
+            new_lab = make_label_for(xv, yv, kind, "BLACK")
             array.set(piv_lab, arr_idx, new_lab)
 
 // === On new HIGH pivot =====================================================
