@@ -388,18 +388,30 @@ if draw_channels and barstate.islast
         if not na(bear_ch_bot_line)
             line.delete(bear_ch_bot_line)
         right_x = bar_index + 10
-        ch_color = in_bear_post_overshoot ? color.new(color.orange, 30) : color.new(color.red, 50)
-        bear_ch_top_line := line.new(ph2_bar, ph2, right_x, bear_ch_top_at(right_x), color=ch_color, width=1)
-        bear_ch_bot_line := line.new(bear_ch_anchor_bar, bear_ch_anchor_low, right_x, bear_ch_bot_at(right_x), color=ch_color, width=1, style=line.style_dashed)
+        ch_color = in_bear_post_overshoot ? color.orange : color.red
+        bear_ch_top_line := line.new(ph2_bar, ph2, right_x, bear_ch_top_at(right_x), color=ch_color, width=2)
+        bear_ch_bot_line := line.new(bear_ch_anchor_bar, bear_ch_anchor_low, right_x, bear_ch_bot_at(right_x), color=ch_color, width=2, style=line.style_dashed)
     if bull_ch_valid and not na(bull_ch_anchor_high)
         if not na(bull_ch_top_line)
             line.delete(bull_ch_top_line)
         if not na(bull_ch_bot_line)
             line.delete(bull_ch_bot_line)
         right_x = bar_index + 10
-        ch_color = in_bull_post_overshoot ? color.new(color.orange, 30) : color.new(color.green, 50)
-        bull_ch_top_line := line.new(bull_ch_anchor_bar, bull_ch_anchor_high, right_x, bull_ch_top_at(right_x), color=ch_color, width=1, style=line.style_dashed)
-        bull_ch_bot_line := line.new(pl2_bar, pl2, right_x, bull_ch_bot_at(right_x), color=ch_color, width=1)
+        ch_color = in_bull_post_overshoot ? color.orange : color.green
+        bull_ch_top_line := line.new(bull_ch_anchor_bar, bull_ch_anchor_high, right_x, bull_ch_top_at(right_x), color=ch_color, width=2, style=line.style_dashed)
+        bull_ch_bot_line := line.new(pl2_bar, pl2, right_x, bull_ch_bot_at(right_x), color=ch_color, width=2)
+
+// ---- Diagnostic status label (top-right) ----
+var label channel_status_label = na
+if draw_channels and barstate.islast
+    if not na(channel_status_label)
+        label.delete(channel_status_label)
+    bear_state_text = bear_ch_valid ? (in_bear_post_overshoot ? "BEAR-OVERSHOT" : "BEAR-ACTIVE") : "BEAR-none"
+    bull_state_text = bull_ch_valid ? (in_bull_post_overshoot ? "BULL-OVERSHOT" : "BULL-ACTIVE") : "BULL-none"
+    ph_text = "PH1=" + (na(ph1) ? "-" : str.tostring(ph1, "#.##")) + " (b" + (na(ph1_bar) ? "-" : str.tostring(bar_index - ph1_bar)) + " ago)  PH2=" + (na(ph2) ? "-" : str.tostring(ph2, "#.##")) + " (b" + (na(ph2_bar) ? "-" : str.tostring(bar_index - ph2_bar)) + " ago)"
+    pl_text = "PL1=" + (na(pl1) ? "-" : str.tostring(pl1, "#.##")) + " (b" + (na(pl1_bar) ? "-" : str.tostring(bar_index - pl1_bar)) + " ago)  PL2=" + (na(pl2) ? "-" : str.tostring(pl2, "#.##")) + " (b" + (na(pl2_bar) ? "-" : str.tostring(bar_index - pl2_bar)) + " ago)"
+    status_text = "Channel: " + bear_state_text + " | " + bull_state_text + "\n" + ph_text + "\n" + pl_text
+    channel_status_label := label.new(bar_index, high, status_text, color=color.new(color.black, 30), textcolor=color.white, style=label.style_label_left, xloc=xloc.bar_index, size=size.normal)
 
 // ============================================================================
 // Helpers
