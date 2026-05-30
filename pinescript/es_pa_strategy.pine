@@ -336,7 +336,11 @@ channel_touch_atr         = input.float(0.5, "Touch tolerance (xATR)", minval=0.
 enable_channel_filter     = input.bool(true, "Enable channel overshoot filter", group="06 Channel filter")
 draw_channels             = input.bool(true, "Draw active channel lines", group="06 Channel filter")
 channel_pivot_strength    = input.int(3,  "Channel pivot strength (bars)", minval=1, maxval=10, group="06 Channel filter")
-channel_method            = input.string("Convex Hull", "Channel method", options=["Convex Hull", "Linear Regression (legacy)"], tooltip="Convex Hull: line passes through the actual extreme pivots (LuxAlgo style). Linear Regression: best-fit average then shifted to upper/lower envelope.", group="06 Channel filter")
+channel_method            = input.string("Andrews Pitchforks", "Channel method", options=["Andrews Pitchforks", "Convex Hull", "Linear Regression (legacy)"], tooltip="Andrews Pitchforks: one pitchfork per pivot-triple, accumulated (matches manual style with top/center/bottom lines). Convex Hull: single channel through extreme pivots. Linear Regression: legacy.", group="06 Channel filter")
+pitchfork_retrace_min     = input.float(0.236, "Pitchfork retracement min", minval=0.0, maxval=1.0, step=0.05, tooltip="Reject pitchforks where the 2nd leg retraces less than this fraction of leg 1.", group="06 Channel filter")
+pitchfork_retrace_max     = input.float(1.0,   "Pitchfork retracement max", minval=0.1, maxval=2.0, step=0.05, group="06 Channel filter")
+pitchfork_extend_bars     = input.int(25,  "Pitchfork extend forward (bars)", minval=5, maxval=200, group="06 Channel filter")
+pitchfork_max_count       = input.int(20,  "Max pitchforks on chart", minval=1, maxval=100, tooltip="Older pitchforks beyond this count are removed.", group="06 Channel filter")
 
 atr14 = ta.atr(14)
 
@@ -405,6 +409,100 @@ if ph_confirmed
 if pl_confirmed
     pl_pending_price := na
     pl_pending_bar   := na
+
+// ============================================================================
+// Unified alternating pivot stream (for Andrews Pitchforks)
+// ----------------------------------------------------------------------------
+// Maintains a strictly alternating PH/PL/PH/PL/... sequence. When a same-type
+// pivot fires consecutively, keep the more extreme one (higher PH or lower PL).
+// ============================================================================
+var array<float> pf_pivot_prices = array.new<float>(0)
+var array<int>   pf_pivot_bars   = array.new<int>(0)
+var array<int>   pf_pivot_types  = array.new<int>(0)   // 1 = PH, -1 = PL
+var int          pf_last_drawn   = 0                   // count of pivots already used to draw a pitchfork
+var array<line>  pf_lines        = array.new<line>(0)  // historical pitchfork lines (3 per fork)
+
+if ph_qualifies
+    if array.size(pf_pivot_types) > 0 and array.last(pf_pivot_types) == 1
+        // Replace last PH with higher one if applicable
+        if ph_value_final > array.last(pf_pivot_prices)
+            array.set(pf_pivot_prices, array.size(pf_pivot_prices) - 1, ph_value_final)
+            array.set(pf_pivot_bars,   array.size(pf_pivot_bars)   - 1, ph_bar_final)
+    else
+        array.push(pf_pivot_prices, ph_value_final)
+        array.push(pf_pivot_bars,   ph_bar_final)
+        array.push(pf_pivot_types,  1)
+if pl_qualifies
+    if array.size(pf_pivot_types) > 0 and array.last(pf_pivot_types) == -1
+        if pl_value_final < array.last(pf_pivot_prices)
+            array.set(pf_pivot_prices, array.size(pf_pivot_prices) - 1, pl_value_final)
+            array.set(pf_pivot_bars,   array.size(pf_pivot_bars)   - 1, pl_bar_final)
+    else
+        array.push(pf_pivot_prices, pl_value_final)
+        array.push(pf_pivot_bars,   pl_bar_final)
+        array.push(pf_pivot_types,  -1)
+
+// Cap pivot stream so memory stays bounded
+while array.size(pf_pivot_prices) > 100
+    array.shift(pf_pivot_prices)
+    array.shift(pf_pivot_bars)
+    array.shift(pf_pivot_types)
+    pf_last_drawn := math.max(0, pf_last_drawn - 1)
+
+// ============================================================================
+// Andrews Pitchforks - draw one per new alternating triple
+// ============================================================================
+if draw_channels and channel_method == "Andrews Pitchforks" and array.size(pf_pivot_prices) > pf_last_drawn and array.size(pf_pivot_prices) >= 3
+    // Use the last 3 pivots in the stream
+    n = array.size(pf_pivot_prices)
+    p0_p = array.get(pf_pivot_prices, n - 3)
+    p0_b = array.get(pf_pivot_bars,   n - 3)
+    p0_t = array.get(pf_pivot_types,  n - 3)
+    p1_p = array.get(pf_pivot_prices, n - 2)
+    p1_b = array.get(pf_pivot_bars,   n - 2)
+    p1_t = array.get(pf_pivot_types,  n - 2)
+    p2_p = array.get(pf_pivot_prices, n - 1)
+    p2_b = array.get(pf_pivot_bars,   n - 1)
+    p2_t = array.get(pf_pivot_types,  n - 1)
+
+    alternates = p0_t == p2_t and p0_t != p1_t
+    leg1 = math.abs(p1_p - p0_p)
+    leg2 = math.abs(p2_p - p1_p)
+    retrace_ratio = leg1 > 0 ? leg2 / leg1 : 0.0
+    retrace_ok = retrace_ratio >= pitchfork_retrace_min and retrace_ratio <= pitchfork_retrace_max
+
+    if alternates and retrace_ok
+        // Classic Andrews median: from P0 through midpoint of P1-P2
+        mid_b = (p1_b + p2_b) / 2.0
+        mid_p = (p1_p + p2_p) / 2.0
+        slope = (mid_p - p0_p) / (mid_b - p0_b)
+
+        // Lines extend from each anchor to (p2_b + extend_bars)
+        right_x = p2_b + pitchfork_extend_bars
+
+        // Median: from P0 to right_x
+        median_right_y = p0_p + slope * (right_x - p0_b)
+        median_line = line.new(p0_b, p0_p, right_x, median_right_y, color=color.new(color.gray, 30), width=1, style=line.style_dashed)
+        array.push(pf_lines, median_line)
+
+        // Upper tine: parallel through P1
+        upper_intercept = p1_p - slope * p1_b
+        upper_right_y = upper_intercept + slope * right_x
+        upper_line = line.new(p1_b, p1_p, right_x, upper_right_y, color=color.new(color.black, 20), width=1)
+        array.push(pf_lines, upper_line)
+
+        // Lower tine: parallel through P2
+        lower_intercept = p2_p - slope * p2_b
+        lower_right_y = lower_intercept + slope * right_x
+        lower_line = line.new(p2_b, p2_p, right_x, lower_right_y, color=color.new(color.black, 20), width=1)
+        array.push(pf_lines, lower_line)
+
+        // Cap historical pitchfork count (each fork = 3 lines)
+        while array.size(pf_lines) > pitchfork_max_count * 3
+            old_line = array.shift(pf_lines)
+            line.delete(old_line)
+
+    pf_last_drawn := array.size(pf_pivot_prices)
 
 // ---- Bear channel state ----
 var array<float> bear_pivot_h = array.new<float>()  // qualifying PHs (rolling window)
@@ -810,7 +908,8 @@ in_bull_post_overshoot = enable_channel_filter and not na(last_bull_overshoot_ba
 //   2. TCL       (solid, thin)   - parallel through anchor C (opposite extreme)
 //   3. Median    (dotted, thin)  - parallel halfway between the two
 // On break: all three freeze in gray.
-if draw_channels and bear_channel_active and not na(bear_C_price)
+// Only draws when channel_method is NOT "Andrews Pitchforks" (which has its own drawing path above).
+if draw_channels and channel_method != "Andrews Pitchforks" and bear_channel_active and not na(bear_C_price)
     right_x = bar_index + 10
     right_tl_y  = bear_trendline_at(right_x)
     right_tcl_y = bear_tcl_at(right_x)
@@ -838,7 +937,7 @@ if draw_channels and bear_channel_active and not na(bear_C_price)
         line.set_xy2(bear_center_line, right_x, right_med_y)
         line.set_color(bear_center_line, color.new(ch_color, 50))
 
-if draw_channels and bull_channel_active and not na(bull_C_price)
+if draw_channels and channel_method != "Andrews Pitchforks" and bull_channel_active and not na(bull_C_price)
     right_x = bar_index + 10
     right_tl_y  = bull_trendline_at(right_x)
     right_tcl_y = bull_tcl_at(right_x)
