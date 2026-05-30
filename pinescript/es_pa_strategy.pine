@@ -441,6 +441,12 @@ bull_slope = bull_channel_active and not na(bull_A_bar) and not na(bull_B_bar) a
 bull_trendline_at(b) => bull_channel_active ? bull_A_price + bull_slope * (b - bull_A_bar) : na
 bull_tcl_at(b) => bull_channel_active and not na(bull_C_price) ? bull_C_price + bull_slope * (b - bull_C_bar) : na
 
+// ---- Channel line refs (declared here so breakout block can freeze them) ----
+var line bear_tl_line  = na
+var line bear_tcl_line = na
+var line bull_tl_line  = na
+var line bull_tcl_line = na
+
 // ---- Channel invalidation (close through TRENDLINE = near side) ----
 bear_trendline_now = bear_trendline_at(bar_index)
 bull_trendline_now = bull_trendline_at(bar_index)
@@ -448,11 +454,28 @@ bear_breakout = bear_channel_active and not na(bear_trendline_now) and close > b
 bull_breakout = bull_channel_active and not na(bull_trendline_now) and close < bull_trendline_now - channel_breakout_atr * atr14
 
 if bear_breakout
+    // Freeze the lines in place as historical reference (gray, no more extending)
+    if not na(bear_tl_line)
+        line.set_x2(bear_tl_line, bar_index)
+        line.set_color(bear_tl_line, color.new(color.gray, 40))
+    if not na(bear_tcl_line)
+        line.set_x2(bear_tcl_line, bar_index)
+        line.set_color(bear_tcl_line, color.new(color.gray, 40))
+    bear_tl_line := na
+    bear_tcl_line := na
     bear_channel_active := false
     bear_A_price := na
     bear_B_price := na
     bear_C_price := na
 if bull_breakout
+    if not na(bull_tl_line)
+        line.set_x2(bull_tl_line, bar_index)
+        line.set_color(bull_tl_line, color.new(color.gray, 40))
+    if not na(bull_tcl_line)
+        line.set_x2(bull_tcl_line, bar_index)
+        line.set_color(bull_tcl_line, color.new(color.gray, 40))
+    bull_tl_line := na
+    bull_tcl_line := na
     bull_channel_active := false
     bull_A_price := na
     bull_B_price := na
@@ -475,33 +498,45 @@ if bull_overshoot
 in_bear_post_overshoot = enable_channel_filter and not na(last_bear_overshoot_bar) and bar_index - last_bear_overshoot_bar < channel_block_bars
 in_bull_post_overshoot = enable_channel_filter and not na(last_bull_overshoot_bar) and bar_index - last_bull_overshoot_bar < channel_block_bars
 
-// ---- Draw active channel lines ----
-var line bear_tl_line  = na
-var line bear_tcl_line = na
-var line bull_tl_line  = na
-var line bull_tcl_line = na
+// ---- Channel line management (every bar - keep historical channels visible) ----
+// Strategy: create line when channel first activates; update right endpoint on
+// each subsequent bar while active. When channel breaks (handled above),
+// freeze the line in place with gray color. New channel creates fresh lines.
+if draw_channels and bear_channel_active and not na(bear_C_price)
+    right_x = bar_index + 10
+    right_tl_y  = bear_trendline_at(right_x)
+    right_tcl_y = bear_tcl_at(right_x)
+    ch_color = in_bear_post_overshoot ? color.orange : color.red
+    if na(bear_tl_line)
+        bear_tl_line := line.new(bear_A_bar, bear_A_price, right_x, right_tl_y, color=ch_color, width=2)
+    else
+        line.set_xy1(bear_tl_line, bear_A_bar, bear_A_price)
+        line.set_xy2(bear_tl_line, right_x, right_tl_y)
+        line.set_color(bear_tl_line, ch_color)
+    if na(bear_tcl_line)
+        bear_tcl_line := line.new(bear_C_bar, bear_C_price, right_x, right_tcl_y, color=ch_color, width=2, style=line.style_dashed)
+    else
+        line.set_xy1(bear_tcl_line, bear_C_bar, bear_C_price)
+        line.set_xy2(bear_tcl_line, right_x, right_tcl_y)
+        line.set_color(bear_tcl_line, ch_color)
 
-if draw_channels and barstate.islast
-    if bear_channel_active
-        if not na(bear_tl_line)
-            line.delete(bear_tl_line)
-        if not na(bear_tcl_line)
-            line.delete(bear_tcl_line)
-        right_x = bar_index + 10
-        ch_color = in_bear_post_overshoot ? color.orange : color.red
-        bear_tl_line := line.new(bear_A_bar, bear_A_price, right_x, bear_trendline_at(right_x), color=ch_color, width=2)
-        if not na(bear_C_price)
-            bear_tcl_line := line.new(bear_C_bar, bear_C_price, right_x, bear_tcl_at(right_x), color=ch_color, width=2, style=line.style_dashed)
-    if bull_channel_active
-        if not na(bull_tl_line)
-            line.delete(bull_tl_line)
-        if not na(bull_tcl_line)
-            line.delete(bull_tcl_line)
-        right_x = bar_index + 10
-        ch_color = in_bull_post_overshoot ? color.orange : color.green
-        bull_tl_line := line.new(bull_A_bar, bull_A_price, right_x, bull_trendline_at(right_x), color=ch_color, width=2)
-        if not na(bull_C_price)
-            bull_tcl_line := line.new(bull_C_bar, bull_C_price, right_x, bull_tcl_at(right_x), color=ch_color, width=2, style=line.style_dashed)
+if draw_channels and bull_channel_active and not na(bull_C_price)
+    right_x = bar_index + 10
+    right_tl_y  = bull_trendline_at(right_x)
+    right_tcl_y = bull_tcl_at(right_x)
+    ch_color = in_bull_post_overshoot ? color.orange : color.green
+    if na(bull_tl_line)
+        bull_tl_line := line.new(bull_A_bar, bull_A_price, right_x, right_tl_y, color=ch_color, width=2)
+    else
+        line.set_xy1(bull_tl_line, bull_A_bar, bull_A_price)
+        line.set_xy2(bull_tl_line, right_x, right_tl_y)
+        line.set_color(bull_tl_line, ch_color)
+    if na(bull_tcl_line)
+        bull_tcl_line := line.new(bull_C_bar, bull_C_price, right_x, right_tcl_y, color=ch_color, width=2, style=line.style_dashed)
+    else
+        line.set_xy1(bull_tcl_line, bull_C_bar, bull_C_price)
+        line.set_xy2(bull_tcl_line, right_x, right_tcl_y)
+        line.set_color(bull_tcl_line, ch_color)
 
 // ---- Diagnostic status label (ALWAYS drawn while debugging - ignores draw_channels) ----
 var label channel_status_label = na
