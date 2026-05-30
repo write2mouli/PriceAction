@@ -192,12 +192,31 @@ if new_pl
 green_y = this_bar_green and show_green ? pl_cand : na
 red_y   = this_bar_red   and show_red   ? ph_cand : na
 
-// Map the string input to a Pine size constant. plotshape requires a
-// CONST size argument, so we can't pass a series -- use a ternary chain.
-arrow_size_const = arrow_size_in == "tiny" ? size.tiny : arrow_size_in == "small" ? size.small : arrow_size_in == "large" ? size.large : arrow_size_in == "huge" ? size.huge : size.normal
+// Pine v5 requires plotshape's `size` to be a compile-time const string,
+// so we can't pass a series. Workaround: one plotshape call per size, each
+// gated by the input. Only the matching one emits non-na, so just one
+// shape draws per pivot.
+plot_tiny_g   = arrow_size_in == "tiny"   ? green_y : na
+plot_small_g  = arrow_size_in == "small"  ? green_y : na
+plot_normal_g = arrow_size_in == "normal" ? green_y : na
+plot_large_g  = arrow_size_in == "large"  ? green_y : na
+plot_huge_g   = arrow_size_in == "huge"   ? green_y : na
+plot_tiny_r   = arrow_size_in == "tiny"   ? red_y : na
+plot_small_r  = arrow_size_in == "small"  ? red_y : na
+plot_normal_r = arrow_size_in == "normal" ? red_y : na
+plot_large_r  = arrow_size_in == "large"  ? red_y : na
+plot_huge_r   = arrow_size_in == "huge"   ? red_y : na
 
-plotshape(green_y, "GREEN low (uptrend)", style=shape.arrowup, location=location.absolute, color=color.green, size=arrow_size_const, offset=-strength)
-plotshape(red_y,   "RED high (downtrend)", style=shape.arrowdown, location=location.absolute, color=color.red, size=arrow_size_const, offset=-strength)
+plotshape(plot_tiny_g,   "GREEN low (tiny)",   style=shape.arrowup, location=location.absolute, color=color.green, size=size.tiny,   offset=-strength)
+plotshape(plot_small_g,  "GREEN low (small)",  style=shape.arrowup, location=location.absolute, color=color.green, size=size.small,  offset=-strength)
+plotshape(plot_normal_g, "GREEN low (normal)", style=shape.arrowup, location=location.absolute, color=color.green, size=size.normal, offset=-strength)
+plotshape(plot_large_g,  "GREEN low (large)",  style=shape.arrowup, location=location.absolute, color=color.green, size=size.large,  offset=-strength)
+plotshape(plot_huge_g,   "GREEN low (huge)",   style=shape.arrowup, location=location.absolute, color=color.green, size=size.huge,   offset=-strength)
+plotshape(plot_tiny_r,   "RED high (tiny)",   style=shape.arrowdown, location=location.absolute, color=color.red, size=size.tiny,   offset=-strength)
+plotshape(plot_small_r,  "RED high (small)",  style=shape.arrowdown, location=location.absolute, color=color.red, size=size.small,  offset=-strength)
+plotshape(plot_normal_r, "RED high (normal)", style=shape.arrowdown, location=location.absolute, color=color.red, size=size.normal, offset=-strength)
+plotshape(plot_large_r,  "RED high (large)",  style=shape.arrowdown, location=location.absolute, color=color.red, size=size.large,  offset=-strength)
+plotshape(plot_huge_r,   "RED high (huge)",   style=shape.arrowdown, location=location.absolute, color=color.red, size=size.huge,   offset=-strength)
 
 // === Status table (viewport-anchored, doesn't move with chart pan) =========
 var table status_tbl = table.new(position.top_right, 2, 2, bgcolor=color.new(color.gray, 80), border_width=1)
