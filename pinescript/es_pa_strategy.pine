@@ -329,6 +329,8 @@ channel_overshoot_atr     = input.float(0.25, "Channel overshoot threshold (xATR
 channel_breakout_atr      = input.float(0.25, "Channel breakout threshold (xATR)",  minval=0.05, maxval=2.0, step=0.05, group="06 Channel filter")
 channel_block_bars        = input.int(30, "Block opposite trades after overshoot (bars)", minval=1, maxval=200, group="06 Channel filter")
 channel_pivot_prominence  = input.float(0.5, "Min pivot prominence (xATR from EMA)", minval=0.0, maxval=3.0, step=0.1, tooltip="Pivot must be at least this many ATRs away from EMA21 to qualify. Filters out micro-pivots in consolidation.", group="06 Channel filter")
+channel_min_AB_bars       = input.int(4, "Min bars between Anchor A and B", minval=1, maxval=50, tooltip="Prevent adjacent pivots from forming a degenerate channel.", group="06 Channel filter")
+channel_touch_atr         = input.float(0.5, "Touch tolerance (xATR)", minval=0.05, maxval=2.0, step=0.05, tooltip="A bar's high counts as a 'touch' of the trendline if within this many ATRs of it.", group="06 Channel filter")
 enable_channel_filter     = input.bool(true, "Enable channel overshoot filter", group="06 Channel filter")
 draw_channels             = input.bool(true, "Draw active channel lines", group="06 Channel filter")
 channel_pivot_strength    = input.int(3,  "Channel pivot strength (bars)", minval=1, maxval=10, group="06 Channel filter")
@@ -354,6 +356,7 @@ var float bear_B_prom = na
 var float bear_C_price = na   // TCL anchor (lowest PL between anchors)
 var int   bear_C_bar = na
 var bool  bear_channel_active = false
+var int   bear_touches = 0    // count of pivot touches on the trendline (incl. A and B)
 
 // ---- Bull channel state ----
 var float bull_A_price = na
@@ -365,6 +368,7 @@ var float bull_B_prom = na
 var float bull_C_price = na   // TCL anchor (highest PH between anchors)
 var int   bull_C_bar = na
 var bool  bull_channel_active = false
+var int   bull_touches = 0
 
 // ---- Bear channel formation ----
 if ph_qualifies
@@ -375,23 +379,35 @@ if ph_qualifies
             bear_A_price := ph_value
             bear_A_bar   := ph_bar
             bear_A_prom  := ph_prom
-        else if ph_value < bear_A_price
-            // 2nd descending qualifying PH -> activate channel
+        else if ph_value < bear_A_price and (ph_bar - bear_A_bar) >= channel_min_AB_bars
+            // 2nd descending qualifying PH at >= min separation -> activate channel
             bear_B_price := ph_value
             bear_B_bar   := ph_bar
             bear_B_prom  := ph_prom
             bear_channel_active := true
-        else
+            bear_touches := 2
+        else if ph_value > bear_A_price
             // Higher than A -> new leg starting; A moves up
             bear_A_price := ph_value
             bear_A_bar   := ph_bar
             bear_A_prom  := ph_prom
     else
-        // Channel active - only replace B by improvement (lower AND more prominent)
-        if ph_value < bear_B_price and ph_prom > bear_B_prom
-            bear_B_price := ph_value
-            bear_B_bar   := ph_bar
-            bear_B_prom  := ph_prom
+        // Channel active - replace B by STEEPER SLOPE (most negative).
+        // Also count as touch if pivot lands close to the existing trendline.
+        if ph_value < bear_A_price and (ph_bar - bear_A_bar) >= channel_min_AB_bars
+            current_slope   = (bear_B_price - bear_A_price) / (bear_B_bar - bear_A_bar)
+            candidate_slope = (ph_value - bear_A_price) / (ph_bar - bear_A_bar)
+            if candidate_slope < current_slope
+                // Steeper line -> replace B, reset touches to 2 (new line, new anchors)
+                bear_B_price := ph_value
+                bear_B_bar   := ph_bar
+                bear_B_prom  := ph_prom
+                bear_touches := 2
+            else
+                // Not steeper. Check if this pivot is close enough to count as a touch.
+                tl_at_pivot = bear_A_price + current_slope * (ph_bar - bear_A_bar)
+                if math.abs(ph_value - tl_at_pivot) <= channel_touch_atr * atr14[channel_pivot_strength]
+                    bear_touches := bear_touches + 1
 
 // Bear TCL anchor (deepest qualifying PL after anchor A)
 if pl_qualifies and bear_channel_active
@@ -410,20 +426,29 @@ if pl_qualifies
             bull_A_price := pl_value
             bull_A_bar   := pl_bar
             bull_A_prom  := pl_prom
-        else if pl_value > bull_A_price
+        else if pl_value > bull_A_price and (pl_bar - bull_A_bar) >= channel_min_AB_bars
             bull_B_price := pl_value
             bull_B_bar   := pl_bar
             bull_B_prom  := pl_prom
             bull_channel_active := true
-        else
+            bull_touches := 2
+        else if pl_value < bull_A_price
             bull_A_price := pl_value
             bull_A_bar   := pl_bar
             bull_A_prom  := pl_prom
     else
-        if pl_value > bull_B_price and pl_prom > bull_B_prom
-            bull_B_price := pl_value
-            bull_B_bar   := pl_bar
-            bull_B_prom  := pl_prom
+        if pl_value > bull_A_price and (pl_bar - bull_A_bar) >= channel_min_AB_bars
+            current_slope   = (bull_B_price - bull_A_price) / (bull_B_bar - bull_A_bar)
+            candidate_slope = (pl_value - bull_A_price) / (pl_bar - bull_A_bar)
+            if candidate_slope > current_slope
+                bull_B_price := pl_value
+                bull_B_bar   := pl_bar
+                bull_B_prom  := pl_prom
+                bull_touches := 2
+            else
+                tl_at_pivot = bull_A_price + current_slope * (pl_bar - bull_A_bar)
+                if math.abs(pl_value - tl_at_pivot) <= channel_touch_atr * atr14[channel_pivot_strength]
+                    bull_touches := bull_touches + 1
 
 if ph_qualifies and bull_channel_active
     ph_value = high[channel_pivot_strength]
@@ -467,6 +492,7 @@ if bear_breakout
     bear_A_price := na
     bear_B_price := na
     bear_C_price := na
+    bear_touches := 0
 if bull_breakout
     if not na(bull_tl_line)
         line.set_x2(bull_tl_line, bar_index)
@@ -480,6 +506,7 @@ if bull_breakout
     bull_A_price := na
     bull_B_price := na
     bull_C_price := na
+    bull_touches := 0
 
 // ---- Overshoot detection (poke through TCL = far side) ----
 bear_tcl_now = bear_tcl_at(bar_index)
@@ -543,8 +570,8 @@ var label channel_status_label = na
 if barstate.islast
     if not na(channel_status_label)
         label.delete(channel_status_label)
-    bear_state_text = bear_channel_active ? (in_bear_post_overshoot ? "BEAR-OVERSHOT(" + str.tostring(bar_index - last_bear_overshoot_bar) + "b)" : "BEAR-ACTIVE") : (na(bear_A_price) ? "BEAR-none" : "BEAR-waiting-B")
-    bull_state_text = bull_channel_active ? (in_bull_post_overshoot ? "BULL-OVERSHOT(" + str.tostring(bar_index - last_bull_overshoot_bar) + "b)" : "BULL-ACTIVE") : (na(bull_A_price) ? "BULL-none" : "BULL-waiting-B")
+    bear_state_text = bear_channel_active ? (in_bear_post_overshoot ? "BEAR-OVERSHOT(" + str.tostring(bar_index - last_bear_overshoot_bar) + "b)" : "BEAR-ACTIVE(" + str.tostring(bear_touches) + "t)") : (na(bear_A_price) ? "BEAR-none" : "BEAR-waiting-B")
+    bull_state_text = bull_channel_active ? (in_bull_post_overshoot ? "BULL-OVERSHOT(" + str.tostring(bar_index - last_bull_overshoot_bar) + "b)" : "BULL-ACTIVE(" + str.tostring(bull_touches) + "t)") : (na(bull_A_price) ? "BULL-none" : "BULL-waiting-B")
     bear_anchors = "Bear A=" + (na(bear_A_price) ? "-" : str.tostring(bear_A_price, "#.##") + "@b" + str.tostring(bar_index - bear_A_bar)) + "  B=" + (na(bear_B_price) ? "-" : str.tostring(bear_B_price, "#.##") + "@b" + str.tostring(bar_index - bear_B_bar)) + "  C=" + (na(bear_C_price) ? "-" : str.tostring(bear_C_price, "#.##") + "@b" + str.tostring(bar_index - bear_C_bar))
     bull_anchors = "Bull A=" + (na(bull_A_price) ? "-" : str.tostring(bull_A_price, "#.##") + "@b" + str.tostring(bar_index - bull_A_bar)) + "  B=" + (na(bull_B_price) ? "-" : str.tostring(bull_B_price, "#.##") + "@b" + str.tostring(bar_index - bull_B_bar)) + "  C=" + (na(bull_C_price) ? "-" : str.tostring(bull_C_price, "#.##") + "@b" + str.tostring(bar_index - bull_C_bar))
     atr_text = "ATR=" + str.tostring(atr14, "#.##") + "  prom>=" + str.tostring(prom_threshold, "#.##") + "  [v2-sticky]"
