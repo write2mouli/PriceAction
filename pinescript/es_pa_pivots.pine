@@ -10,12 +10,23 @@
 //        AND a confirming LH.
 //      - DOWN -> UP: needs HH breaking prior LH by same threshold, AND HL.
 //      - On confirmation, trend extreme is retroactively marked BLACK.
-//   3. Display:
-//      - plotshape arrows for GREEN (uptrend lows) and RED (downtrend highs)
-//        -- these auto-anchor to bars via Pine's pipeline
-//      - line.new vertical bars for BLACK trend-switch markers (also bar-
-//        anchored; replaces labels which had reports of not panning with
-//        the chart)
+//   3. Coloring (3-color Brooks/Dow scheme):
+//        State after pivot processing | Pivot type    | Color  | Meaning
+//        UP   + HH (high)              | continuation | GREEN  | trend high
+//        UP   + HL (low)               | continuation | GREEN  | tradeable long pullback
+//        UP   + LH (high)              | warning      | GRAY   | failed continuation
+//        UP   + LL (low)               | break        | GRAY   | structural break pending
+//        DOWN + LL (low)               | continuation | RED    | trend low
+//        DOWN + LH (high)              | continuation | RED    | tradeable short pullback
+//        DOWN + HL (low)               | warning      | GRAY   | failed continuation
+//        DOWN + HH (high)              | break        | GRAY   | structural break pending
+//        PEND_UP / PEND_DOWN           | any          | GRAY   | reversal pending
+//        UNK                           | any          | GRAY   | trend not established yet
+//        trend extreme                 | retroactive  | BLACK  | trend-switch pivot
+//   4. Drawing:
+//      - plotshape arrows for green/red/gray (auto bar-anchored)
+//      - line.new vertical bars for BLACK markers (also bar-anchored)
+//      - table in top-right for trend state + pivot count
 //
 // Validation: /ES 2m 5/29 RTH -> 5 BLACK at ~10:00 / 10:44 / 12:40 / 14:00 / 15:42
 // ============================================================================
@@ -25,12 +36,12 @@ indicator("ES PA Pivots", overlay=true, max_lines_count=500)
 // Inputs ---------------------------------------------------------------------
 strength      = input.int(2,   "Pivot strength (bars each side)", minval=1, maxval=10, group="Pivot")
 min_break_atr = input.float(0.5, "Reversal break (xATR)", minval=0.0, maxval=3.0, step=0.05, tooltip="LL must undercut prior HL (or HH overshoot prior LH) by this many ATRs to trigger reversal. 0 = any structural break.", group="Trend state")
-show_black    = input.bool(true,  "Show BLACK trend-switch markers",   group="Display")
-show_green    = input.bool(true,  "Show GREEN HL/HH lows in uptrend",  group="Display")
-show_red      = input.bool(true,  "Show RED LH/LL highs in downtrend", group="Display")
+show_black    = input.bool(true,  "Show BLACK trend-switch markers", group="Display")
+show_green    = input.bool(true,  "Show GREEN trend-continuation pivots", group="Display")
+show_red      = input.bool(true,  "Show RED trend-continuation pivots", group="Display")
+show_gray     = input.bool(true,  "Show GRAY counter-trend / warning pivots", group="Display")
 show_ema      = input.bool(true,  "Show EMA21", group="Display")
 ema_length    = input.int(21, "EMA length", minval=5, maxval=200, group="Display")
-arrow_size_in = input.string("normal", "Arrow size", options=["tiny","small","normal","large","huge"], tooltip="Fixed pixel size (doesn't scale with chart zoom). 'huge' is biggest.", group="Display")
 black_marker_height_atr = input.float(0.4, "BLACK marker height (xATR)", minval=0.05, maxval=2.0, step=0.05, group="Display")
 black_marker_width = input.int(3, "BLACK marker line width", minval=1, maxval=8, group="Display")
 
@@ -46,11 +57,9 @@ new_ph = not na(ph_cand)
 new_pl = not na(pl_cand)
 
 // Alternated pivot stream ---------------------------------------------------
-// Each pivot recorded as price + bar index + kind (1=H, -1=L). No labels --
-// drawing is done by plotshape (per-bar arrows) + line.new (BLACK markers).
-var array<float> piv_p   = array.new<float>(0)
-var array<int>   piv_b   = array.new<int>(0)
-var array<int>   piv_t   = array.new<int>(0)
+var array<float> piv_p = array.new<float>(0)
+var array<int>   piv_b = array.new<int>(0)
+var array<int>   piv_t = array.new<int>(0)
 
 // Trend state ---------------------------------------------------------------
 // 0=UNK, 1=UP, 2=DOWN, 3=PEND_UP, 4=PEND_DOWN
@@ -64,12 +73,15 @@ var int   extreme_l_i  = na
 var float last_HL_p    = na
 var float last_LH_p    = na
 
-// Per-bar plotshape flags. Series bool resets to false each bar by default.
-bool this_bar_green = false
-bool this_bar_red   = false
+// Per-bar plotshape flags (6 combinations: 3 colors x 2 directions)
+bool flag_green_h = false  // HH during UP
+bool flag_green_l = false  // HL during UP
+bool flag_red_h   = false  // LH during DOWN
+bool flag_red_l   = false  // LL during DOWN
+bool flag_gray_h  = false  // any high not fitting clean UP-continuation
+bool flag_gray_l  = false  // any low not fitting clean UP/DOWN-continuation
 
-// Push a new pivot or replace the last same-kind extreme. Returns array idx
-// or -1 if push was skipped. Pure data; no drawing.
+// Push a new pivot or replace the last same-kind extreme
 push_alt(p, b, kind) =>
     n = array.size(piv_t)
     out_idx = -1
@@ -95,7 +107,7 @@ push_alt(p, b, kind) =>
             out_idx := array.size(piv_t) - 1
     out_idx
 
-// Draw a BLACK marker (vertical line) at a past pivot bar
+// Draw BLACK vertical line at a past pivot
 draw_black(arr_idx, kind) =>
     if arr_idx >= 0
         if arr_idx < array.size(piv_b)
@@ -141,13 +153,13 @@ if new_ph
             tstate := 2
         else if tstate == 0 and struct_h == "HH"
             tstate := 1
-        // RED arrow if the trend state is DOWN AFTER processing this pivot's
-        // transitions. Covers normal LH/LL during DOWN, the confirming LH
-        // that flips PEND_DOWN to DOWN, and the fallback LH that returns
-        // PEND_UP to DOWN. HH during DOWN that flips to PEND_UP is NOT red
-        // (it's a breakout signal, not a downtrend continuation).
-        if tstate == 2
-            this_bar_red := true
+        // Color decision (state AFTER processing)
+        if tstate == 1 and struct_h == "HH"
+            flag_green_h := true
+        else if tstate == 2 and struct_h == "LH"
+            flag_red_h := true
+        else
+            flag_gray_h := true
 
 // === On new LOW pivot ======================================================
 if new_pl
@@ -182,43 +194,33 @@ if new_pl
             tstate := 1
         else if tstate == 0 and struct_l == "LL"
             tstate := 2
-        // GREEN arrow if state is UP after processing
-        if tstate == 1
-            this_bar_green := true
+        // Color decision
+        if tstate == 1 and struct_l == "HL"
+            flag_green_l := true
+        else if tstate == 2 and struct_l == "LL"
+            flag_red_l := true
+        else
+            flag_gray_l := true
 
-// === plotshape: GREEN at lows during UP, RED at highs during DOWN ==========
-// offset=-strength shifts the shape back to the actual pivot bar (the
-// candidate fires `strength` bars after the pivot bar).
-green_y = this_bar_green and show_green ? pl_cand : na
-red_y   = this_bar_red   and show_red   ? ph_cand : na
+// === plotshape outputs =====================================================
+// 6 plotshape calls (3 colors x 2 directions). Highs get arrow-down,
+// lows get arrow-up. Gray uses size.small (more subtle), green/red use
+// size.normal. offset=-strength shifts shapes to the pivot bar.
+src_green_h = flag_green_h and show_green ? ph_cand : na
+src_green_l = flag_green_l and show_green ? pl_cand : na
+src_red_h   = flag_red_h   and show_red   ? ph_cand : na
+src_red_l   = flag_red_l   and show_red   ? pl_cand : na
+src_gray_h  = flag_gray_h  and show_gray  ? ph_cand : na
+src_gray_l  = flag_gray_l  and show_gray  ? pl_cand : na
 
-// Pine v5 requires plotshape's `size` to be a compile-time const string,
-// so we can't pass a series. Workaround: one plotshape call per size, each
-// gated by the input. Only the matching one emits non-na, so just one
-// shape draws per pivot.
-plot_tiny_g   = arrow_size_in == "tiny"   ? green_y : na
-plot_small_g  = arrow_size_in == "small"  ? green_y : na
-plot_normal_g = arrow_size_in == "normal" ? green_y : na
-plot_large_g  = arrow_size_in == "large"  ? green_y : na
-plot_huge_g   = arrow_size_in == "huge"   ? green_y : na
-plot_tiny_r   = arrow_size_in == "tiny"   ? red_y : na
-plot_small_r  = arrow_size_in == "small"  ? red_y : na
-plot_normal_r = arrow_size_in == "normal" ? red_y : na
-plot_large_r  = arrow_size_in == "large"  ? red_y : na
-plot_huge_r   = arrow_size_in == "huge"   ? red_y : na
+plotshape(src_green_h, "GREEN high (HH in UP)",    style=shape.arrowdown, location=location.absolute, color=color.green, size=size.normal, offset=-strength)
+plotshape(src_green_l, "GREEN low (HL in UP)",     style=shape.arrowup,   location=location.absolute, color=color.green, size=size.normal, offset=-strength)
+plotshape(src_red_h,   "RED high (LH in DOWN)",    style=shape.arrowdown, location=location.absolute, color=color.red,   size=size.normal, offset=-strength)
+plotshape(src_red_l,   "RED low (LL in DOWN)",     style=shape.arrowup,   location=location.absolute, color=color.red,   size=size.normal, offset=-strength)
+plotshape(src_gray_h,  "GRAY high (counter/UNK)",  style=shape.arrowdown, location=location.absolute, color=color.gray,  size=size.small,  offset=-strength)
+plotshape(src_gray_l,  "GRAY low (counter/UNK)",   style=shape.arrowup,   location=location.absolute, color=color.gray,  size=size.small,  offset=-strength)
 
-plotshape(plot_tiny_g,   "GREEN low (tiny)",   style=shape.arrowup, location=location.absolute, color=color.green, size=size.tiny,   offset=-strength)
-plotshape(plot_small_g,  "GREEN low (small)",  style=shape.arrowup, location=location.absolute, color=color.green, size=size.small,  offset=-strength)
-plotshape(plot_normal_g, "GREEN low (normal)", style=shape.arrowup, location=location.absolute, color=color.green, size=size.normal, offset=-strength)
-plotshape(plot_large_g,  "GREEN low (large)",  style=shape.arrowup, location=location.absolute, color=color.green, size=size.large,  offset=-strength)
-plotshape(plot_huge_g,   "GREEN low (huge)",   style=shape.arrowup, location=location.absolute, color=color.green, size=size.huge,   offset=-strength)
-plotshape(plot_tiny_r,   "RED high (tiny)",   style=shape.arrowdown, location=location.absolute, color=color.red, size=size.tiny,   offset=-strength)
-plotshape(plot_small_r,  "RED high (small)",  style=shape.arrowdown, location=location.absolute, color=color.red, size=size.small,  offset=-strength)
-plotshape(plot_normal_r, "RED high (normal)", style=shape.arrowdown, location=location.absolute, color=color.red, size=size.normal, offset=-strength)
-plotshape(plot_large_r,  "RED high (large)",  style=shape.arrowdown, location=location.absolute, color=color.red, size=size.large,  offset=-strength)
-plotshape(plot_huge_r,   "RED high (huge)",   style=shape.arrowdown, location=location.absolute, color=color.red, size=size.huge,   offset=-strength)
-
-// === Status table (viewport-anchored, doesn't move with chart pan) =========
+// === Status table (viewport-anchored) ======================================
 var table status_tbl = table.new(position.top_right, 2, 2, bgcolor=color.new(color.gray, 80), border_width=1)
 if barstate.islast
     state_s = tstate == 0 ? "UNK" : (tstate == 1 ? "UP" : (tstate == 2 ? "DOWN" : (tstate == 3 ? "PEND_UP" : "PEND_DOWN")))

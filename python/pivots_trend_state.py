@@ -126,10 +126,13 @@ def main():
     fig, ax = plt.subplots(figsize=(32, 14), dpi=150)
     draw_candles(ax, ts, o, h, l, c, ema=ema)
 
-    n_shown_black = n_shown_green = n_shown_red = 0
+    n_shown_black = n_shown_green = n_shown_red = n_shown_gray = 0
+    # Build map: pivot bar -> structural label, from alt sequence
+    alt_struct_by_bar = {p.idx: lab for p, lab in zip(alt_pivots, alt_labels)}
     for p in raw_pivots:
         st = bar_state[p.idx]
         is_black = p.idx in black_bars
+        struct = alt_struct_by_bar.get(p.idx, "UNK")
         if is_black:
             if p.kind == "H":
                 ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price + 2.0),
@@ -138,22 +141,42 @@ def main():
                 ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price - 2.0),
                             arrowprops=dict(arrowstyle="->", color="black", lw=2.5))
             n_shown_black += 1
-        elif st == "UP" and p.kind == "L":
-            ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price - 1.5),
-                        arrowprops=dict(arrowstyle="->", color="green", lw=1.6))
+        # Trend-continuation: GREEN
+        # - HH/HL during UP state
+        elif st == "UP" and (struct == "HH" or struct == "HL"):
+            if p.kind == "H":
+                ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price + 1.5),
+                            arrowprops=dict(arrowstyle="->", color="green", lw=1.6))
+            else:
+                ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price - 1.5),
+                            arrowprops=dict(arrowstyle="->", color="green", lw=1.6))
             n_shown_green += 1
-        elif st == "DOWN" and p.kind == "H":
-            ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price + 1.5),
-                        arrowprops=dict(arrowstyle="->", color="red", lw=1.6))
+        # - LL/LH during DOWN state
+        elif st == "DOWN" and (struct == "LL" or struct == "LH"):
+            if p.kind == "H":
+                ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price + 1.5),
+                            arrowprops=dict(arrowstyle="->", color="red", lw=1.6))
+            else:
+                ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price - 1.5),
+                            arrowprops=dict(arrowstyle="->", color="red", lw=1.6))
             n_shown_red += 1
-        # else: hide (wrong-kind in current trend)
+        # Counter-trend / UNK / pending: GRAY
+        else:
+            if p.kind == "H":
+                ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price + 0.8),
+                            arrowprops=dict(arrowstyle="->", color="gray", lw=1.0))
+            else:
+                ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price - 0.8),
+                            arrowprops=dict(arrowstyle="->", color="gray", lw=1.0))
+            n_shown_gray += 1
 
-    total = n_shown_black + n_shown_green + n_shown_red
+    total = n_shown_black + n_shown_green + n_shown_red + n_shown_gray
     ax.set_title(
-        f"/ES 2m {target.isoformat()} RTH ({n} bars) | RAW s=2 + trend-state labelling | "
-        f"BLACK={n_shown_black}  GREEN(HL/HH in UP)={n_shown_green}  "
-        f"RED(LH/LL in DOWN)={n_shown_red}  TOTAL shown={total}",
-        fontsize=13,
+        f"/ES 2m {target.isoformat()} RTH ({n} bars) | 3-color Brooks scheme | "
+        f"BLACK={n_shown_black}  GREEN(trend-continuation in UP)={n_shown_green}  "
+        f"RED(trend-continuation in DOWN)={n_shown_red}  "
+        f"GRAY(counter/UNK/pending)={n_shown_gray}  TOTAL={total}",
+        fontsize=12,
     )
     ax.legend(loc="upper left", fontsize=11)
     plt.tight_layout()
