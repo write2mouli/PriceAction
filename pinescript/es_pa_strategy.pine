@@ -329,8 +329,9 @@ channel_overshoot_atr     = input.float(0.25, "Channel overshoot threshold (xATR
 channel_breakout_atr      = input.float(0.25, "Channel breakout threshold (xATR)",  minval=0.05, maxval=2.0, step=0.05, group="06 Channel filter")
 channel_block_bars        = input.int(30, "Block opposite trades after overshoot (bars)", minval=1, maxval=200, group="06 Channel filter")
 channel_pivot_prominence  = input.float(0.5, "Min pivot prominence (xATR from EMA)", minval=0.0, maxval=3.0, step=0.1, tooltip="Pivot must be at least this many ATRs away from EMA21 to qualify. Filters out micro-pivots in consolidation.", group="06 Channel filter")
-channel_min_AB_bars       = input.int(4, "Min bars between Anchor A and B", minval=1, maxval=50, tooltip="Prevent adjacent pivots from forming a degenerate channel.", group="06 Channel filter")
-channel_touch_atr         = input.float(0.5, "Touch tolerance (xATR)", minval=0.05, maxval=2.0, step=0.05, tooltip="A bar's high counts as a 'touch' of the trendline if within this many ATRs of it.", group="06 Channel filter")
+channel_min_pivots        = input.int(2, "Min pivots to form channel", minval=2, maxval=5, group="06 Channel filter")
+channel_max_pivots        = input.int(8, "Max pivots in rolling window", minval=2, maxval=20, tooltip="Older pivots beyond this count are evicted from the regression set.", group="06 Channel filter")
+channel_touch_atr         = input.float(0.5, "Touch tolerance (xATR)", minval=0.05, maxval=2.0, step=0.05, tooltip="A pivot counts as a 'touch' of the trendline if within this many ATRs of it.", group="06 Channel filter")
 enable_channel_filter     = input.bool(true, "Enable channel overshoot filter", group="06 Channel filter")
 draw_channels             = input.bool(true, "Draw active channel lines", group="06 Channel filter")
 channel_pivot_strength    = input.int(3,  "Channel pivot strength (bars)", minval=1, maxval=10, group="06 Channel filter")
@@ -347,69 +348,67 @@ ph_qualifies = not na(ph) and ph_prom >= prom_threshold
 pl_qualifies = not na(pl) and pl_prom >= prom_threshold
 
 // ---- Bear channel state ----
-var float bear_A_price = na
+var array<float> bear_pivot_h = array.new<float>()  // qualifying PHs (rolling window)
+var array<int>   bear_pivot_b = array.new<int>()
+var float bear_A_price = na    // leftmost pivot in window (for line drawing)
 var int   bear_A_bar = na
-var float bear_A_prom = na
-var float bear_B_price = na
+var float bear_B_price = na    // rightmost pivot in window
 var int   bear_B_bar = na
-var float bear_B_prom = na
-var float bear_C_price = na   // TCL anchor (lowest PL between anchors)
+var float bear_C_price = na    // TCL anchor (deepest qualifying PL)
 var int   bear_C_bar = na
 var bool  bear_channel_active = false
-var int   bear_touches = 0    // count of pivot touches on the trendline (incl. A and B)
+var int   bear_touches = 0
+var float bear_regression_slope = 0.0
+var float bear_regression_intercept = 0.0
 
 // ---- Bull channel state ----
+var array<float> bull_pivot_l = array.new<float>()  // qualifying PLs
+var array<int>   bull_pivot_b = array.new<int>()
 var float bull_A_price = na
 var int   bull_A_bar = na
-var float bull_A_prom = na
 var float bull_B_price = na
 var int   bull_B_bar = na
-var float bull_B_prom = na
-var float bull_C_price = na   // TCL anchor (highest PH between anchors)
+var float bull_C_price = na    // TCL anchor (highest qualifying PH)
 var int   bull_C_bar = na
 var bool  bull_channel_active = false
 var int   bull_touches = 0
+var float bull_regression_slope = 0.0
+var float bull_regression_intercept = 0.0
 
-// ---- Bear channel formation ----
+// ---- Helper: linear regression on (bars, prices) arrays ----
+// Returns [slope, intercept]. Returns [0, 0] if degenerate.
+linreg_arr(bars_arr, prices_arr) =>
+    n = array.size(bars_arr)
+    sum_x = 0.0
+    sum_y = 0.0
+    sum_xx = 0.0
+    sum_xy = 0.0
+    for i = 0 to n - 1
+        x = array.get(bars_arr, i)
+        y = array.get(prices_arr, i)
+        sum_x  := sum_x + x
+        sum_y  := sum_y + y
+        sum_xx := sum_xx + x * x
+        sum_xy := sum_xy + x * y
+    mean_x = n > 0 ? sum_x / n : 0.0
+    mean_y = n > 0 ? sum_y / n : 0.0
+    denom  = sum_xx - n * mean_x * mean_x
+    slope  = denom != 0 ? (sum_xy - n * mean_x * mean_y) / denom : 0.0
+    intercept = mean_y - slope * mean_x
+    [slope, intercept]
+
+// ---- Bear channel formation (regression-based) ----
 if ph_qualifies
     ph_value = high[channel_pivot_strength]
     ph_bar   = bar_index - channel_pivot_strength
-    if not bear_channel_active
-        if na(bear_A_price)
-            bear_A_price := ph_value
-            bear_A_bar   := ph_bar
-            bear_A_prom  := ph_prom
-        else if ph_value < bear_A_price and (ph_bar - bear_A_bar) >= channel_min_AB_bars
-            // 2nd descending qualifying PH at >= min separation -> activate channel
-            bear_B_price := ph_value
-            bear_B_bar   := ph_bar
-            bear_B_prom  := ph_prom
-            bear_channel_active := true
-            bear_touches := 2
-        else if ph_value > bear_A_price
-            // Higher than A -> new leg starting; A moves up
-            bear_A_price := ph_value
-            bear_A_bar   := ph_bar
-            bear_A_prom  := ph_prom
-    else
-        // Channel active - replace B by STEEPER SLOPE (most negative).
-        // Also count as touch if pivot lands close to the existing trendline.
-        if ph_value < bear_A_price and (ph_bar - bear_A_bar) >= channel_min_AB_bars
-            current_slope   = (bear_B_price - bear_A_price) / (bear_B_bar - bear_A_bar)
-            candidate_slope = (ph_value - bear_A_price) / (ph_bar - bear_A_bar)
-            if candidate_slope < current_slope
-                // Steeper line -> replace B, reset touches to 2 (new line, new anchors)
-                bear_B_price := ph_value
-                bear_B_bar   := ph_bar
-                bear_B_prom  := ph_prom
-                bear_touches := 2
-            else
-                // Not steeper. Check if this pivot is close enough to count as a touch.
-                tl_at_pivot = bear_A_price + current_slope * (ph_bar - bear_A_bar)
-                if math.abs(ph_value - tl_at_pivot) <= channel_touch_atr * atr14[channel_pivot_strength]
-                    bear_touches := bear_touches + 1
+    // If this PH is higher than all in array, it might signal a new leg / wider channel.
+    // Don't clear — let the rolling window evict naturally.
+    array.push(bear_pivot_h, ph_value)
+    array.push(bear_pivot_b, ph_bar)
+    while array.size(bear_pivot_h) > channel_max_pivots
+        array.shift(bear_pivot_h)
+        array.shift(bear_pivot_b)
 
-// Bear TCL anchor (deepest qualifying PL after anchor A)
 if pl_qualifies and bear_channel_active
     pl_value = low[channel_pivot_strength]
     pl_bar   = bar_index - channel_pivot_strength
@@ -417,38 +416,39 @@ if pl_qualifies and bear_channel_active
         bear_C_price := pl_value
         bear_C_bar   := pl_bar
 
+// Re-evaluate bear channel from current pivot set
+if array.size(bear_pivot_h) >= channel_min_pivots
+    [slp, icpt] = linreg_arr(bear_pivot_b, bear_pivot_h)
+    // Bear channel requires descending slope
+    if slp < 0
+        bear_regression_slope := slp
+        bear_regression_intercept := icpt
+        bear_A_bar := array.first(bear_pivot_b)
+        bear_A_price := icpt + slp * bear_A_bar
+        bear_B_bar := array.last(bear_pivot_b)
+        bear_B_price := icpt + slp * bear_B_bar
+        // Touch count: pivots within tolerance of the regression line
+        touches = 0
+        for i = 0 to array.size(bear_pivot_h) - 1
+            xv = array.get(bear_pivot_b, i)
+            yv = array.get(bear_pivot_h, i)
+            line_y = icpt + slp * xv
+            if math.abs(yv - line_y) <= channel_touch_atr * atr14
+                touches := touches + 1
+        bear_touches := touches
+        // Activate if we have enough pivots and at least 2 touches
+        if bear_touches >= 2 and not bear_channel_active
+            bear_channel_active := true
+
 // ---- Bull channel formation (mirror) ----
 if pl_qualifies
     pl_value = low[channel_pivot_strength]
     pl_bar   = bar_index - channel_pivot_strength
-    if not bull_channel_active
-        if na(bull_A_price)
-            bull_A_price := pl_value
-            bull_A_bar   := pl_bar
-            bull_A_prom  := pl_prom
-        else if pl_value > bull_A_price and (pl_bar - bull_A_bar) >= channel_min_AB_bars
-            bull_B_price := pl_value
-            bull_B_bar   := pl_bar
-            bull_B_prom  := pl_prom
-            bull_channel_active := true
-            bull_touches := 2
-        else if pl_value < bull_A_price
-            bull_A_price := pl_value
-            bull_A_bar   := pl_bar
-            bull_A_prom  := pl_prom
-    else
-        if pl_value > bull_A_price and (pl_bar - bull_A_bar) >= channel_min_AB_bars
-            current_slope   = (bull_B_price - bull_A_price) / (bull_B_bar - bull_A_bar)
-            candidate_slope = (pl_value - bull_A_price) / (pl_bar - bull_A_bar)
-            if candidate_slope > current_slope
-                bull_B_price := pl_value
-                bull_B_bar   := pl_bar
-                bull_B_prom  := pl_prom
-                bull_touches := 2
-            else
-                tl_at_pivot = bull_A_price + current_slope * (pl_bar - bull_A_bar)
-                if math.abs(pl_value - tl_at_pivot) <= channel_touch_atr * atr14[channel_pivot_strength]
-                    bull_touches := bull_touches + 1
+    array.push(bull_pivot_l, pl_value)
+    array.push(bull_pivot_b, pl_bar)
+    while array.size(bull_pivot_l) > channel_max_pivots
+        array.shift(bull_pivot_l)
+        array.shift(bull_pivot_b)
 
 if ph_qualifies and bull_channel_active
     ph_value = high[channel_pivot_strength]
@@ -457,14 +457,34 @@ if ph_qualifies and bull_channel_active
         bull_C_price := ph_value
         bull_C_bar   := ph_bar
 
-// ---- Channel line equations ----
-bear_slope = bear_channel_active and not na(bear_A_bar) and not na(bear_B_bar) and bear_B_bar > bear_A_bar ? (bear_B_price - bear_A_price) / (bear_B_bar - bear_A_bar) : 0.0
-bear_trendline_at(b) => bear_channel_active ? bear_A_price + bear_slope * (b - bear_A_bar) : na
-bear_tcl_at(b) => bear_channel_active and not na(bear_C_price) ? bear_C_price + bear_slope * (b - bear_C_bar) : na
+if array.size(bull_pivot_l) >= channel_min_pivots
+    [slp, icpt] = linreg_arr(bull_pivot_b, bull_pivot_l)
+    if slp > 0
+        bull_regression_slope := slp
+        bull_regression_intercept := icpt
+        bull_A_bar := array.first(bull_pivot_b)
+        bull_A_price := icpt + slp * bull_A_bar
+        bull_B_bar := array.last(bull_pivot_b)
+        bull_B_price := icpt + slp * bull_B_bar
+        touches = 0
+        for i = 0 to array.size(bull_pivot_l) - 1
+            xv = array.get(bull_pivot_b, i)
+            yv = array.get(bull_pivot_l, i)
+            line_y = icpt + slp * xv
+            if math.abs(yv - line_y) <= channel_touch_atr * atr14
+                touches := touches + 1
+        bull_touches := touches
+        if bull_touches >= 2 and not bull_channel_active
+            bull_channel_active := true
 
-bull_slope = bull_channel_active and not na(bull_A_bar) and not na(bull_B_bar) and bull_B_bar > bull_A_bar ? (bull_B_price - bull_A_price) / (bull_B_bar - bull_A_bar) : 0.0
-bull_trendline_at(b) => bull_channel_active ? bull_A_price + bull_slope * (b - bull_A_bar) : na
-bull_tcl_at(b) => bull_channel_active and not na(bull_C_price) ? bull_C_price + bull_slope * (b - bull_C_bar) : na
+// ---- Channel line equations (using regression slope) ----
+bear_slope = bear_regression_slope
+bear_trendline_at(b) => bear_channel_active ? bear_regression_intercept + bear_regression_slope * b : na
+bear_tcl_at(b) => bear_channel_active and not na(bear_C_price) ? bear_C_price + bear_regression_slope * (b - bear_C_bar) : na
+
+bull_slope = bull_regression_slope
+bull_trendline_at(b) => bull_channel_active ? bull_regression_intercept + bull_regression_slope * b : na
+bull_tcl_at(b) => bull_channel_active and not na(bull_C_price) ? bull_C_price + bull_regression_slope * (b - bull_C_bar) : na
 
 // ---- Channel line refs (declared here so breakout block can freeze them) ----
 var line bear_tl_line     = na
@@ -499,6 +519,10 @@ if bear_breakout
     bear_B_price := na
     bear_C_price := na
     bear_touches := 0
+    bear_regression_slope := 0.0
+    bear_regression_intercept := 0.0
+    array.clear(bear_pivot_h)
+    array.clear(bear_pivot_b)
 if bull_breakout
     if not na(bull_tl_line)
         line.set_x2(bull_tl_line, bar_index)
@@ -517,6 +541,10 @@ if bull_breakout
     bull_B_price := na
     bull_C_price := na
     bull_touches := 0
+    bull_regression_slope := 0.0
+    bull_regression_intercept := 0.0
+    array.clear(bull_pivot_l)
+    array.clear(bull_pivot_b)
 
 // ---- Overshoot detection (poke through TCL = far side) ----
 bear_tcl_now = bear_tcl_at(bar_index)
