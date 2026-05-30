@@ -503,16 +503,16 @@ if draw_channels and barstate.islast
         if not na(bull_C_price)
             bull_tcl_line := line.new(bull_C_bar, bull_C_price, right_x, bull_tcl_at(right_x), color=ch_color, width=2, style=line.style_dashed)
 
-// ---- Diagnostic status label ----
+// ---- Diagnostic status label (ALWAYS drawn while debugging - ignores draw_channels) ----
 var label channel_status_label = na
-if draw_channels and barstate.islast
+if barstate.islast
     if not na(channel_status_label)
         label.delete(channel_status_label)
     bear_state_text = bear_channel_active ? (in_bear_post_overshoot ? "BEAR-OVERSHOT(" + str.tostring(bar_index - last_bear_overshoot_bar) + "b)" : "BEAR-ACTIVE") : (na(bear_A_price) ? "BEAR-none" : "BEAR-waiting-B")
     bull_state_text = bull_channel_active ? (in_bull_post_overshoot ? "BULL-OVERSHOT(" + str.tostring(bar_index - last_bull_overshoot_bar) + "b)" : "BULL-ACTIVE") : (na(bull_A_price) ? "BULL-none" : "BULL-waiting-B")
     bear_anchors = "Bear A=" + (na(bear_A_price) ? "-" : str.tostring(bear_A_price, "#.##") + "@b" + str.tostring(bar_index - bear_A_bar)) + "  B=" + (na(bear_B_price) ? "-" : str.tostring(bear_B_price, "#.##") + "@b" + str.tostring(bar_index - bear_B_bar)) + "  C=" + (na(bear_C_price) ? "-" : str.tostring(bear_C_price, "#.##") + "@b" + str.tostring(bar_index - bear_C_bar))
     bull_anchors = "Bull A=" + (na(bull_A_price) ? "-" : str.tostring(bull_A_price, "#.##") + "@b" + str.tostring(bar_index - bull_A_bar)) + "  B=" + (na(bull_B_price) ? "-" : str.tostring(bull_B_price, "#.##") + "@b" + str.tostring(bar_index - bull_B_bar)) + "  C=" + (na(bull_C_price) ? "-" : str.tostring(bull_C_price, "#.##") + "@b" + str.tostring(bar_index - bull_C_bar))
-    atr_text = "ATR=" + str.tostring(atr14, "#.##") + "  prom>=" + str.tostring(prom_threshold, "#.##")
+    atr_text = "ATR=" + str.tostring(atr14, "#.##") + "  prom>=" + str.tostring(prom_threshold, "#.##") + "  [v2-sticky]"
     status_text = bear_state_text + " | " + bull_state_text + "\n" + bear_anchors + "\n" + bull_anchors + "\n" + atr_text
     channel_status_label := label.new(bar_index, high, status_text, color=color.new(color.black, 20), textcolor=color.white, style=label.style_label_left, xloc=xloc.bar_index, size=size.normal)
 
