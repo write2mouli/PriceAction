@@ -79,12 +79,12 @@ var int   bull_state          = 0
 var int   bull_leg_start      = na
 var float bull_swing_high     = na
 var bool  bull_ema_touched    = false
-var int   bull_leg1_bars      = 0
-var int   bull_leg1_ll_bars   = 0
-var float bull_leg1_low       = na
-var int   bull_leg2_bars      = 0
-var int   bull_leg2_ll_bars   = 0
-var float bull_leg2_low       = na
+var int   bull_l1_bars      = 0
+var int   bull_l1_ll   = 0
+var float bull_l1_low       = na
+var int   bull_l2_bars      = 0
+var int   bull_l2_ll   = 0
+var float bull_l2_low       = na
 var bool  bull_fire           = false
 bull_fire := false
 
@@ -96,12 +96,12 @@ if not bull_trend
     bull_state := 0
     bull_swing_high := na
     bull_ema_touched := false
-    bull_leg1_bars := 0
-    bull_leg1_ll_bars := 0
-    bull_leg1_low := na
-    bull_leg2_bars := 0
-    bull_leg2_ll_bars := 0
-    bull_leg2_low := na
+    bull_l1_bars := 0
+    bull_l1_ll := 0
+    bull_l1_low := na
+    bull_l2_bars := 0
+    bull_l2_ll := 0
+    bull_l2_low := na
 
 if bull_trend
     if bull_state == 0
@@ -109,12 +109,12 @@ if bull_trend
             bull_state := 1
             bull_leg_start := bar_index
             bull_swing_high := high[1]
-            bull_leg1_bars := 1
-            bull_leg1_ll_bars := low < low[1] ? 1 : 0
-            bull_leg1_low := low
-            bull_leg2_bars := 0
-            bull_leg2_ll_bars := 0
-            bull_leg2_low := na
+            bull_l1_bars := 1
+            bull_l1_ll := low < low[1] ? 1 : 0
+            bull_l1_low := low
+            bull_l2_bars := 0
+            bull_l2_ll := 0
+            bull_l2_low := na
             bull_ema_touched := low <= ema21 + prox
     else if bull_state == 1
         if high > bull_swing_high
@@ -125,10 +125,10 @@ if bull_trend
             bull_state := 2
             bull_leg_start := bar_index
         else
-            bull_leg1_bars := bull_leg1_bars + 1
+            bull_l1_bars := bull_l1_bars + 1
             if low < low[1]
-                bull_leg1_ll_bars := bull_leg1_ll_bars + 1
-            bull_leg1_low := math.min(bull_leg1_low, low)
+                bull_l1_ll := bull_l1_ll + 1
+            bull_l1_low := math.min(bull_l1_low, low)
             if low <= ema21 + prox
                 bull_ema_touched := true
     else if bull_state == 2
@@ -137,9 +137,9 @@ if bull_trend
         else if bull_pb_continues
             bull_state := 3
             bull_leg_start := bar_index
-            bull_leg2_bars := 1
-            bull_leg2_ll_bars := low < low[1] ? 1 : 0
-            bull_leg2_low := low
+            bull_l2_bars := 1
+            bull_l2_ll := low < low[1] ? 1 : 0
+            bull_l2_low := low
             if low <= ema21 + prox
                 bull_ema_touched := true
     else if bull_state == 3
@@ -151,34 +151,34 @@ if bull_trend
             bull_fire := true
             bull_state := 0
         else
-            bull_leg2_bars := bull_leg2_bars + 1
+            bull_l2_bars := bull_l2_bars + 1
             if low < low[1]
-                bull_leg2_ll_bars := bull_leg2_ll_bars + 1
-            bull_leg2_low := math.min(bull_leg2_low, low)
+                bull_l2_ll := bull_l2_ll + 1
+            bull_l2_low := math.min(bull_l2_low, low)
             if low <= ema21 + prox
                 bull_ema_touched := true
 
 // Score (FLIPPED: HL/double-bottom is best)
 // NOTE: forced float division. Pine v5 int/int truncates (e.g. 2/3 = 0).
-bull_l1_mom  = bull_leg1_bars > 0 ? bull_leg1_ll_bars * 1.0 / bull_leg1_bars : 0.0
-bull_l2_mom  = bull_leg2_bars > 0 ? bull_leg2_ll_bars * 1.0 / bull_leg2_bars : 0.0
+bull_l1_mom  = bull_l1_bars > 0 ? bull_l1_ll * 1.0 / bull_l1_bars : 0.0
+bull_l2_mom  = bull_l2_bars > 0 ? bull_l2_ll * 1.0 / bull_l2_bars : 0.0
 bull_s_l1    = math.round(bull_l1_mom * 3)
 bull_s_l2    = math.round(bull_l2_mom * 3)
-bull_s_depth = (not na(bull_leg2_low) and not na(bull_leg1_low) and bull_leg2_low >  bull_leg1_low) ? 3 : ((not na(bull_leg2_low) and not na(bull_leg1_low) and bull_leg2_low >= bull_leg1_low - 2 * tick_sz) ? 1 : 0)
-bull_s_bars  = (bull_leg1_bars >= 2 and bull_leg2_bars >= 2) ? 1 : 0
+bull_s_depth = (not na(bull_l2_low) and not na(bull_l1_low) and bull_l2_low >  bull_l1_low) ? 3 : ((not na(bull_l2_low) and not na(bull_l1_low) and bull_l2_low >= bull_l1_low - 2 * tick_sz) ? 1 : 0)
+bull_s_bars  = (bull_l1_bars >= 2 and bull_l2_bars >= 2) ? 1 : 0
 bull_score   = bull_s_l1 + bull_s_l2 + bull_s_depth + bull_s_bars
 
-bull_depth_ok = not na(bull_swing_high) and not na(bull_leg1_low) and (bull_swing_high - math.min(bull_leg1_low, nz(bull_leg2_low, bull_leg1_low))) >= min_pullback_ticks * tick_sz
+bull_depth_ok = not na(bull_swing_high) and not na(bull_l1_low) and (bull_swing_high - math.min(bull_l1_low, nz(bull_l2_low, bull_l1_low))) >= min_pullback_ticks * tick_sz
 fire_2EL = bull_fire and bull_depth_ok and bull_ema_touched and bull_score >= min_quality_score and (not require_sig_bar or valid_long_sig)
 
 // Capture entry / stop / target prices on trigger bar for line drawing
-var float fired_2EL_entry  = na
-var float fired_2EL_stop   = na
-var float fired_2EL_target = na
+var float p_long_entry  = na
+var float p_long_stop   = na
+var float p_long_target = na
 if fire_2EL
-    fired_2EL_entry  := high[1] + tick_sz
-    fired_2EL_stop   := stop_mode == "fixed_ticks" ? (fired_2EL_entry - stop_ticks * tick_sz) : (nz(bull_leg2_low, bull_leg1_low) - tick_sz)
-    fired_2EL_target := target_mode == "fixed_1pt" ? (fired_2EL_entry + 4 * tick_sz) : target_mode == "fixed_2pt" ? (fired_2EL_entry + 8 * tick_sz) : bull_swing_high
+    p_long_entry  := high[1] + tick_sz
+    p_long_stop   := stop_mode == "fixed_ticks" ? (p_long_entry - stop_ticks * tick_sz) : (nz(bull_l2_low, bull_l1_low) - tick_sz)
+    p_long_target := target_mode == "fixed_1pt" ? (p_long_entry + 4 * tick_sz) : target_mode == "fixed_2pt" ? (p_long_entry + 8 * tick_sz) : bull_swing_high
 
 // ============================================================================
 // BEAR state machine (mirror)
@@ -187,12 +187,12 @@ var int   bear_state          = 0
 var int   bear_leg_start      = na
 var float bear_swing_low      = na
 var bool  bear_ema_touched    = false
-var int   bear_leg1_bars      = 0
-var int   bear_leg1_hh_bars   = 0
-var float bear_leg1_high      = na
-var int   bear_leg2_bars      = 0
-var int   bear_leg2_hh_bars   = 0
-var float bear_leg2_high      = na
+var int   bear_l1_bars      = 0
+var int   bear_l1_hh   = 0
+var float bear_l1_high      = na
+var int   bear_l2_bars      = 0
+var int   bear_l2_hh   = 0
+var float bear_l2_high      = na
 var bool  bear_fire           = false
 bear_fire := false
 
@@ -203,12 +203,12 @@ if not bear_trend
     bear_state := 0
     bear_swing_low := na
     bear_ema_touched := false
-    bear_leg1_bars := 0
-    bear_leg1_hh_bars := 0
-    bear_leg1_high := na
-    bear_leg2_bars := 0
-    bear_leg2_hh_bars := 0
-    bear_leg2_high := na
+    bear_l1_bars := 0
+    bear_l1_hh := 0
+    bear_l1_high := na
+    bear_l2_bars := 0
+    bear_l2_hh := 0
+    bear_l2_high := na
 
 if bear_trend
     if bear_state == 0
@@ -216,12 +216,12 @@ if bear_trend
             bear_state := 1
             bear_leg_start := bar_index
             bear_swing_low := low[1]
-            bear_leg1_bars := 1
-            bear_leg1_hh_bars := high > high[1] ? 1 : 0
-            bear_leg1_high := high
-            bear_leg2_bars := 0
-            bear_leg2_hh_bars := 0
-            bear_leg2_high := na
+            bear_l1_bars := 1
+            bear_l1_hh := high > high[1] ? 1 : 0
+            bear_l1_high := high
+            bear_l2_bars := 0
+            bear_l2_hh := 0
+            bear_l2_high := na
             bear_ema_touched := high >= ema21 - prox
     else if bear_state == 1
         if low < bear_swing_low
@@ -232,10 +232,10 @@ if bear_trend
             bear_state := 2
             bear_leg_start := bar_index
         else
-            bear_leg1_bars := bear_leg1_bars + 1
+            bear_l1_bars := bear_l1_bars + 1
             if high > high[1]
-                bear_leg1_hh_bars := bear_leg1_hh_bars + 1
-            bear_leg1_high := math.max(bear_leg1_high, high)
+                bear_l1_hh := bear_l1_hh + 1
+            bear_l1_high := math.max(bear_l1_high, high)
             if high >= ema21 - prox
                 bear_ema_touched := true
     else if bear_state == 2
@@ -244,9 +244,9 @@ if bear_trend
         else if bear_pb_continues
             bear_state := 3
             bear_leg_start := bar_index
-            bear_leg2_bars := 1
-            bear_leg2_hh_bars := high > high[1] ? 1 : 0
-            bear_leg2_high := high
+            bear_l2_bars := 1
+            bear_l2_hh := high > high[1] ? 1 : 0
+            bear_l2_high := high
             if high >= ema21 - prox
                 bear_ema_touched := true
     else if bear_state == 3
@@ -258,33 +258,33 @@ if bear_trend
             bear_fire := true
             bear_state := 0
         else
-            bear_leg2_bars := bear_leg2_bars + 1
+            bear_l2_bars := bear_l2_bars + 1
             if high > high[1]
-                bear_leg2_hh_bars := bear_leg2_hh_bars + 1
-            bear_leg2_high := math.max(bear_leg2_high, high)
+                bear_l2_hh := bear_l2_hh + 1
+            bear_l2_high := math.max(bear_l2_high, high)
             if high >= ema21 - prox
                 bear_ema_touched := true
 
 // Score (FLIPPED: LH/double-top is best)
 // NOTE: forced float division. Pine v5 int/int truncates (e.g. 2/3 = 0).
-bear_l1_mom  = bear_leg1_bars > 0 ? bear_leg1_hh_bars * 1.0 / bear_leg1_bars : 0.0
-bear_l2_mom  = bear_leg2_bars > 0 ? bear_leg2_hh_bars * 1.0 / bear_leg2_bars : 0.0
+bear_l1_mom  = bear_l1_bars > 0 ? bear_l1_hh * 1.0 / bear_l1_bars : 0.0
+bear_l2_mom  = bear_l2_bars > 0 ? bear_l2_hh * 1.0 / bear_l2_bars : 0.0
 bear_s_l1    = math.round(bear_l1_mom * 3)
 bear_s_l2    = math.round(bear_l2_mom * 3)
-bear_s_depth = (not na(bear_leg2_high) and not na(bear_leg1_high) and bear_leg2_high <  bear_leg1_high) ? 3 : ((not na(bear_leg2_high) and not na(bear_leg1_high) and bear_leg2_high <= bear_leg1_high + 2 * tick_sz) ? 1 : 0)
-bear_s_bars  = (bear_leg1_bars >= 2 and bear_leg2_bars >= 2) ? 1 : 0
+bear_s_depth = (not na(bear_l2_high) and not na(bear_l1_high) and bear_l2_high <  bear_l1_high) ? 3 : ((not na(bear_l2_high) and not na(bear_l1_high) and bear_l2_high <= bear_l1_high + 2 * tick_sz) ? 1 : 0)
+bear_s_bars  = (bear_l1_bars >= 2 and bear_l2_bars >= 2) ? 1 : 0
 bear_score   = bear_s_l1 + bear_s_l2 + bear_s_depth + bear_s_bars
 
-bear_depth_ok = not na(bear_swing_low) and not na(bear_leg1_high) and (math.max(bear_leg1_high, nz(bear_leg2_high, bear_leg1_high)) - bear_swing_low) >= min_pullback_ticks * tick_sz
+bear_depth_ok = not na(bear_swing_low) and not na(bear_l1_high) and (math.max(bear_l1_high, nz(bear_l2_high, bear_l1_high)) - bear_swing_low) >= min_pullback_ticks * tick_sz
 fire_2ES = bear_fire and bear_depth_ok and bear_ema_touched and bear_score >= min_quality_score and (not require_sig_bar or valid_short_sig)
 
-var float fired_2ES_entry  = na
-var float fired_2ES_stop   = na
-var float fired_2ES_target = na
+var float p_short_entry  = na
+var float p_short_stop   = na
+var float p_short_target = na
 if fire_2ES
-    fired_2ES_entry  := low[1] - tick_sz
-    fired_2ES_stop   := stop_mode == "fixed_ticks" ? (fired_2ES_entry + stop_ticks * tick_sz) : (nz(bear_leg2_high, bear_leg1_high) + tick_sz)
-    fired_2ES_target := target_mode == "fixed_1pt" ? (fired_2ES_entry - 4 * tick_sz) : target_mode == "fixed_2pt" ? (fired_2ES_entry - 8 * tick_sz) : bear_swing_low
+    p_short_entry  := low[1] - tick_sz
+    p_short_stop   := stop_mode == "fixed_ticks" ? (p_short_entry + stop_ticks * tick_sz) : (nz(bear_l2_high, bear_l1_high) + tick_sz)
+    p_short_target := target_mode == "fixed_1pt" ? (p_short_entry - 4 * tick_sz) : target_mode == "fixed_2pt" ? (p_short_entry - 8 * tick_sz) : bear_swing_low
 
 // ============================================================================
 // Grade helpers
@@ -308,19 +308,19 @@ plotshape(show_leg_markers and in_bear_leg2, title="bear leg2", style=shape.circ
 
 // Entry labels with grade
 if fire_2EL
-    label.new(bar_index, low, "2EL " + grade_for(bull_score) + str.tostring(bull_score) + " (L1:" + str.tostring(bull_leg1_bars) + "/" + str.tostring(bull_leg1_ll_bars) + " L2:" + str.tostring(bull_leg2_bars) + "/" + str.tostring(bull_leg2_ll_bars) + ")", style=label.style_label_up, color=color_for(bull_score), textcolor=color.white, size=size.small, yloc=yloc.belowbar)
+    label.new(bar_index, low, "2EL " + grade_for(bull_score) + str.tostring(bull_score) + " (L1:" + str.tostring(bull_l1_bars) + "/" + str.tostring(bull_l1_ll) + " L2:" + str.tostring(bull_l2_bars) + "/" + str.tostring(bull_l2_ll) + ")", style=label.style_label_up, color=color_for(bull_score), textcolor=color.white, size=size.small, yloc=yloc.belowbar)
 if fire_2ES
-    label.new(bar_index, high, "2ES " + grade_for(bear_score) + str.tostring(bear_score) + " (L1:" + str.tostring(bear_leg1_bars) + "/" + str.tostring(bear_leg1_hh_bars) + " L2:" + str.tostring(bear_leg2_bars) + "/" + str.tostring(bear_leg2_hh_bars) + ")", style=label.style_label_down, color=color_for(bear_score), textcolor=color.white, size=size.small, yloc=yloc.abovebar)
+    label.new(bar_index, high, "2ES " + grade_for(bear_score) + str.tostring(bear_score) + " (L1:" + str.tostring(bear_l1_bars) + "/" + str.tostring(bear_l1_hh) + " L2:" + str.tostring(bear_l2_bars) + "/" + str.tostring(bear_l2_hh) + ")", style=label.style_label_down, color=color_for(bear_score), textcolor=color.white, size=size.small, yloc=yloc.abovebar)
 
 // Entry / stop / target lines (drawn on the trigger bar, extend forward)
 if draw_entry_lines and fire_2EL
-    line.new(bar_index, fired_2EL_entry,  bar_index + line_extend_bars, fired_2EL_entry,  color=color.white, width=1, style=line.style_dashed)
-    line.new(bar_index, fired_2EL_stop,   bar_index + line_extend_bars, fired_2EL_stop,   color=color.red,   width=1, style=line.style_dotted)
-    line.new(bar_index, fired_2EL_target, bar_index + line_extend_bars, fired_2EL_target, color=color.lime,  width=1, style=line.style_dotted)
+    line.new(bar_index, p_long_entry,  bar_index + line_extend_bars, p_long_entry,  color=color.white, width=1, style=line.style_dashed)
+    line.new(bar_index, p_long_stop,   bar_index + line_extend_bars, p_long_stop,   color=color.red,   width=1, style=line.style_dotted)
+    line.new(bar_index, p_long_target, bar_index + line_extend_bars, p_long_target, color=color.lime,  width=1, style=line.style_dotted)
 if draw_entry_lines and fire_2ES
-    line.new(bar_index, fired_2ES_entry,  bar_index + line_extend_bars, fired_2ES_entry,  color=color.white, width=1, style=line.style_dashed)
-    line.new(bar_index, fired_2ES_stop,   bar_index + line_extend_bars, fired_2ES_stop,   color=color.red,   width=1, style=line.style_dotted)
-    line.new(bar_index, fired_2ES_target, bar_index + line_extend_bars, fired_2ES_target, color=color.lime,  width=1, style=line.style_dotted)
+    line.new(bar_index, p_short_entry,  bar_index + line_extend_bars, p_short_entry,  color=color.white, width=1, style=line.style_dashed)
+    line.new(bar_index, p_short_stop,   bar_index + line_extend_bars, p_short_stop,   color=color.red,   width=1, style=line.style_dotted)
+    line.new(bar_index, p_short_target, bar_index + line_extend_bars, p_short_target, color=color.lime,  width=1, style=line.style_dotted)
 
 // Trend label (upper-right corner)
 var label trend_lbl = na
