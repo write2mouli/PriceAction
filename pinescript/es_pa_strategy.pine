@@ -316,23 +316,47 @@ color_for(s) =>
     s >= 8 ? color.lime : s >= 6 ? color.new(#7fc97f, 0) : s >= 4 ? color.yellow : color.orange
 
 // ============================================================================
-// Strategy: place orders on trigger bars
+// Strategy: place / refresh pending buy stop on every LEG2 bar
+// ----------------------------------------------------------------------------
+// Brooks-style: the buy stop sits above the last LEG2 bar's high. When the
+// next bar breaks higher, it fills INTRABAR at the trigger price - not 1 bar
+// late. We refresh every LEG2 bar so the stop tracks the most recent high.
+// If state leaves LEG2 without filling (timeout, new HH abort, or quality
+// degraded), the order is cancelled.
 // ============================================================================
-// Track pending entries so we can cancel after expiry.
-var int  pending_long_bar  = na
-var int  pending_short_bar = na
+var int pending_long_bar  = na
+var int pending_short_bar = na
 
-if fire_2EL and strategy.position_size == 0
-    strategy.entry("2EL", strategy.long, stop=p_long_entry, comment="2EL " + grade_for(bull_score) + str.tostring(bull_score))
-    strategy.exit("2EL_x", from_entry="2EL", stop=p_long_stop, limit=p_long_target, comment_loss="stop", comment_profit="target")
-    pending_long_bar := bar_index
+bull_setup_active = bull_state == 3 and bull_ema_touched and bull_depth_ok and bull_score >= min_quality_score and (not require_sig_bar or valid_long_sig) and allow_longs and in_session
+bear_setup_active = bear_state == 3 and bear_ema_touched and bear_depth_ok and bear_score >= min_quality_score and (not require_sig_bar or valid_short_sig) and allow_shorts and in_session
 
-if fire_2ES and strategy.position_size == 0
-    strategy.entry("2ES", strategy.short, stop=p_short_entry, comment="2ES " + grade_for(bear_score) + str.tostring(bear_score))
-    strategy.exit("2ES_x", from_entry="2ES", stop=p_short_stop, limit=p_short_target, comment_loss="stop", comment_profit="target")
-    pending_short_bar := bar_index
+if bull_setup_active and strategy.position_size == 0
+    p_long_entry  := high + tick_sz
+    p_long_stop   := stop_mode == "fixed_ticks" ? (p_long_entry - stop_ticks * tick_sz) : (bull_l2_low - tick_sz)
+    p_long_target := target_mode == "fixed_1pt" ? (p_long_entry + 4 * tick_sz) : target_mode == "fixed_2pt" ? (p_long_entry + 8 * tick_sz) : bull_swing_high
+    if p_long_stop < p_long_entry and p_long_target > p_long_entry
+        strategy.entry("2EL", strategy.long, stop=p_long_entry, comment="2EL " + grade_for(bull_score) + str.tostring(bull_score))
+        strategy.exit("2EL_x", from_entry="2EL", stop=p_long_stop, limit=p_long_target, comment_loss="stop", comment_profit="target")
+        pending_long_bar := bar_index
 
-// Cancel pending entries that haven't filled after entry_expiry_bars
+if bear_setup_active and strategy.position_size == 0
+    p_short_entry  := low - tick_sz
+    p_short_stop   := stop_mode == "fixed_ticks" ? (p_short_entry + stop_ticks * tick_sz) : (bear_l2_high + tick_sz)
+    p_short_target := target_mode == "fixed_1pt" ? (p_short_entry - 4 * tick_sz) : target_mode == "fixed_2pt" ? (p_short_entry - 8 * tick_sz) : bear_swing_low
+    if p_short_stop > p_short_entry and p_short_target < p_short_entry
+        strategy.entry("2ES", strategy.short, stop=p_short_entry, comment="2ES " + grade_for(bear_score) + str.tostring(bear_score))
+        strategy.exit("2ES_x", from_entry="2ES", stop=p_short_stop, limit=p_short_target, comment_loss="stop", comment_profit="target")
+        pending_short_bar := bar_index
+
+// Cancel pending orders when setup is no longer active and we're still flat
+if not bull_setup_active and not na(pending_long_bar) and strategy.position_size == 0
+    strategy.cancel("2EL")
+    pending_long_bar := na
+if not bear_setup_active and not na(pending_short_bar) and strategy.position_size == 0
+    strategy.cancel("2ES")
+    pending_short_bar := na
+
+// Belt-and-suspenders: entry_expiry_bars cap (rarely hits since LEG2 has its own max_leg_bars)
 if not na(pending_long_bar) and bar_index - pending_long_bar > entry_expiry_bars and strategy.position_size == 0
     strategy.cancel("2EL")
     pending_long_bar := na
