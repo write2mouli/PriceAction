@@ -109,6 +109,228 @@ class Pivot:
     kind: str  # 'H' or 'L'
 
 
+def label_trend_state(
+    pivots: List["Pivot"],
+    atr_v: "np.ndarray | None" = None,
+    min_break_atr: float = 0.5,
+) -> List[str]:
+    """Walk alternating pivots and emit a Brooks-style label per pivot.
+
+    Labels: 'HH', 'HL', 'LH', 'LL', 'BLACK', 'UNK'
+    - 'BLACK' = trend-switching extreme.
+    - 'UNK' = no prior same-kind pivot to compare against.
+
+    Range / strong-break detection:
+    For an UP -> DOWN reversal to fire, the new LL must be at least
+    `min_break_atr` * ATR BELOW the most recent HL (the prior pullback low).
+    A weak LL that only barely undercuts the last HL is treated as "within
+    range" and does NOT flip the trend. Same logic mirrored for DOWN -> UP
+    (HH must be `min_break_atr` * ATR ABOVE the most recent LH).
+
+    If atr_v is None, the break threshold collapses to 0 (any structural
+    break triggers the reversal, matching the prior behavior).
+
+    For Mouli's display convention:
+      - During UP trend, show only LOWs (HL/HH).
+      - During DOWN trend, show only HIGHs (LH/LL).
+      - Show ALL BLACK pivots regardless of kind.
+    """
+    n = len(pivots)
+    labels: List[str] = [""] * n
+    state = "UNK"  # 'UP', 'DOWN', 'UNK', 'PEND_DOWN', 'PEND_UP'
+    last_h_price = None
+    last_l_price = None
+    extreme_h_idx = None
+    extreme_h_price = -float("inf")
+    extreme_l_idx = None
+    extreme_l_price = float("inf")
+    # Track most recent HL price (during UP, used as the "support" to break
+    # for an UP -> DOWN reversal) and most recent LH (used as "resistance"
+    # for DOWN -> UP). Reset on trend change.
+    last_HL_price = None
+    last_LH_price = None
+
+    def reset_for_new_trend(new_state, anchor_idx, anchor_price, anchor_kind):
+        nonlocal extreme_h_idx, extreme_h_price, extreme_l_idx, extreme_l_price
+        if new_state == "UP":
+            extreme_l_idx, extreme_l_price = None, float("inf")
+            if anchor_kind == "H":
+                extreme_h_idx, extreme_h_price = anchor_idx, anchor_price
+            else:
+                extreme_h_idx, extreme_h_price = None, -float("inf")
+        else:
+            extreme_h_idx, extreme_h_price = None, -float("inf")
+            if anchor_kind == "L":
+                extreme_l_idx, extreme_l_price = anchor_idx, anchor_price
+            else:
+                extreme_l_idx, extreme_l_price = None, float("inf")
+
+    for i, p in enumerate(pivots):
+        # Threshold for "definitive break" if ATR is available
+        thr = (atr_v[p.idx] * min_break_atr) if atr_v is not None else 0.0
+        if p.kind == "H":
+            struct = "UNK" if last_h_price is None else (
+                "HH" if p.price > last_h_price else "LH"
+            )
+            labels[i] = struct
+            if p.price > extreme_h_price:
+                extreme_h_idx = i
+                extreme_h_price = p.price
+            last_h_price = p.price
+            if struct == "LH":
+                last_LH_price = p.price
+            # Transitions on a HIGH pivot
+            if state == "DOWN" and struct == "HH":
+                # Strong break = HH price exceeds most recent LH by thr
+                if last_LH_price is None or (p.price - last_LH_price) >= thr:
+                    state = "PEND_UP"
+            elif state == "PEND_DOWN" and struct == "LH":
+                if extreme_h_idx is not None and extreme_h_idx != i:
+                    labels[extreme_h_idx] = "BLACK"
+                state = "DOWN"
+                reset_for_new_trend("DOWN", extreme_l_idx, extreme_l_price, "L")
+                last_HL_price = None
+                last_LH_price = p.price
+            elif state == "PEND_UP" and struct == "LH":
+                state = "DOWN"
+            elif state == "UNK" and struct == "HH":
+                state = "UP"
+        else:  # L
+            struct = "UNK" if last_l_price is None else (
+                "LL" if p.price < last_l_price else "HL"
+            )
+            labels[i] = struct
+            if p.price < extreme_l_price:
+                extreme_l_idx = i
+                extreme_l_price = p.price
+            last_l_price = p.price
+            if struct == "HL":
+                last_HL_price = p.price
+            # Transitions on a LOW pivot
+            if state == "UP" and struct == "LL":
+                # Strong break = LL undercuts most recent HL by thr
+                if last_HL_price is None or (last_HL_price - p.price) >= thr:
+                    state = "PEND_DOWN"
+            elif state == "PEND_UP" and struct == "HL":
+                if extreme_l_idx is not None and extreme_l_idx != i:
+                    labels[extreme_l_idx] = "BLACK"
+                state = "UP"
+                reset_for_new_trend("UP", extreme_h_idx, extreme_h_price, "H")
+                last_LH_price = None
+                last_HL_price = p.price
+            elif state == "PEND_DOWN" and struct == "HL":
+                state = "UP"
+            elif state == "UNK" and struct == "LL":
+                state = "DOWN"
+
+    # Forward-look at end of session: if still in a trend or pending, mark the
+    # current extreme as BLACK provisionally (matches Mouli marking the latest
+    # swing top/bottom even if no reversal has formed yet).
+    if state in ("UP", "PEND_DOWN") and extreme_h_idx is not None and labels[extreme_h_idx] != "BLACK":
+        labels[extreme_h_idx] = "BLACK"
+    elif state in ("DOWN", "PEND_UP") and extreme_l_idx is not None and labels[extreme_l_idx] != "BLACK":
+        labels[extreme_l_idx] = "BLACK"
+
+    return labels
+
+
+def trend_state_at_pivot(pivots: List["Pivot"], labels: List[str]) -> List[str]:
+    """For each pivot, return the trend STATE active at the time it formed.
+    Returns one of 'UP', 'DOWN', 'UNK' for each pivot.
+
+    Used for Mouli's display: hide pivots whose kind is opposite to the trend
+    state (e.g., highs during UP, lows during DOWN).
+    """
+    n = len(pivots)
+    states = ["UNK"] * n
+    state = "UNK"
+    for i, p in enumerate(pivots):
+        # Pivot is in the trend state that was active BEFORE the label change
+        states[i] = state
+        if labels[i] == "BLACK":
+            # Trend reverses AT this pivot; the pivot itself belongs to the
+            # outgoing trend, but subsequent pivots are in the new state.
+            state = "DOWN" if p.kind == "H" else "UP"
+        elif labels[i] in ("HH", "HL") and state == "UNK":
+            state = "UP"
+        elif labels[i] in ("LL", "LH") and state == "UNK":
+            state = "DOWN"
+    return states
+
+
+def detect_raw_fractals(h: np.ndarray, l: np.ndarray, strength: int = 2) -> List["Pivot"]:
+    """Williams fractal pivots WITHOUT alternation collapse.
+
+    Returns every bar that is a strength-N local high or low. Used for display
+    (every visible swing is a separate marker) while a separate alternated
+    sequence drives trend-state detection.
+    """
+    n = len(h)
+    raw: List[Pivot] = []
+    for i in range(strength, n - strength):
+        is_ph = True
+        is_pl = True
+        for k in range(1, strength + 1):
+            if h[i] <= h[i - k] or h[i] < h[i + k]:
+                is_ph = False
+            if l[i] >= l[i - k] or l[i] > l[i + k]:
+                is_pl = False
+            if not is_ph and not is_pl:
+                break
+        if is_ph:
+            raw.append(Pivot(idx=i, price=h[i], kind="H"))
+        if is_pl and not is_ph:
+            raw.append(Pivot(idx=i, price=l[i], kind="L"))
+    return raw
+
+
+def detect_pivots_raw_alternating(
+    h: np.ndarray,
+    l: np.ndarray,
+    strength: int = 1,
+) -> List[Pivot]:
+    """Mouli-style: every visible swing is a pivot.
+
+    Strength=1: a bar's high is a peak if > prev AND > next (3-bar fractal).
+    Strength=2: same, but compared against 2 bars on each side.
+    No prominence, no ZigZag confirmation. After raw fractals are collected,
+    enforce strict H/L alternation by keeping the MORE EXTREME of any
+    consecutive same-kind run (e.g., two consecutive highs -> keep the higher
+    one only).
+    """
+    n = len(h)
+    raw: List[Pivot] = []
+    for i in range(strength, n - strength):
+        is_ph = True
+        is_pl = True
+        for k in range(1, strength + 1):
+            if h[i] <= h[i - k] or h[i] < h[i + k]:
+                is_ph = False
+            if l[i] >= l[i - k] or l[i] > l[i + k]:
+                is_pl = False
+            if not is_ph and not is_pl:
+                break
+        if is_ph:
+            raw.append(Pivot(idx=i, price=h[i], kind="H"))
+        # Tie-break: if both ph and pl (rare, doji), pick the more extreme based on body
+        if is_pl and not is_ph:
+            raw.append(Pivot(idx=i, price=l[i], kind="L"))
+    # Enforce alternation: collapse runs of same-kind, keeping the extreme
+    alt: List[Pivot] = []
+    for p in raw:
+        if not alt:
+            alt.append(p)
+            continue
+        if alt[-1].kind == p.kind:
+            # Same kind run - keep the more extreme
+            if (p.kind == "H" and p.price > alt[-1].price) or \
+               (p.kind == "L" and p.price < alt[-1].price):
+                alt[-1] = p
+        else:
+            alt.append(p)
+    return alt
+
+
 def detect_pivots(
     h: np.ndarray,
     l: np.ndarray,
