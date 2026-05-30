@@ -129,6 +129,10 @@ def main():
     n_shown_black = n_shown_green = n_shown_red = n_shown_gray = 0
     # Build map: pivot bar -> structural label, from alt sequence
     alt_struct_by_bar = {p.idx: lab for p, lab in zip(alt_pivots, alt_labels)}
+    # Mouli's strict rule:
+    # - UP trend: only LOWS shown. HL=green, LL=gray warning. Highs hidden.
+    # - DOWN trend: only HIGHS shown. LH=red, HH=gray warning. Lows hidden.
+    # - BLACK at trend extreme (retroactive).
     for p in raw_pivots:
         st = bar_state[p.idx]
         is_black = p.idx in black_bars
@@ -141,34 +145,27 @@ def main():
                 ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price - 2.0),
                             arrowprops=dict(arrowstyle="->", color="black", lw=2.5))
             n_shown_black += 1
-        # Trend-continuation: GREEN
-        # - HH/HL during UP state
-        elif st == "UP" and (struct == "HH" or struct == "HL"):
-            if p.kind == "H":
-                ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price + 1.5),
-                            arrowprops=dict(arrowstyle="->", color="green", lw=1.6))
-            else:
+        elif st == "UP" and p.kind == "L":
+            if struct == "HL":
+                # GREEN trend-continuation low
                 ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price - 1.5),
                             arrowprops=dict(arrowstyle="->", color="green", lw=1.6))
-            n_shown_green += 1
-        # - LL/LH during DOWN state
-        elif st == "DOWN" and (struct == "LL" or struct == "LH"):
-            if p.kind == "H":
+                n_shown_green += 1
+            elif struct == "LL":
+                # GRAY warning low (structural break in uptrend)
+                ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price - 1.0),
+                            arrowprops=dict(arrowstyle="->", color="gray", lw=1.2))
+                n_shown_gray += 1
+        elif st == "DOWN" and p.kind == "H":
+            if struct == "LH":
                 ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price + 1.5),
                             arrowprops=dict(arrowstyle="->", color="red", lw=1.6))
-            else:
-                ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price - 1.5),
-                            arrowprops=dict(arrowstyle="->", color="red", lw=1.6))
-            n_shown_red += 1
-        # Counter-trend / UNK / pending: GRAY
-        else:
-            if p.kind == "H":
-                ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price + 0.8),
-                            arrowprops=dict(arrowstyle="->", color="gray", lw=1.0))
-            else:
-                ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price - 0.8),
-                            arrowprops=dict(arrowstyle="->", color="gray", lw=1.0))
-            n_shown_gray += 1
+                n_shown_red += 1
+            elif struct == "HH":
+                ax.annotate("", xy=(p.idx, p.price), xytext=(p.idx, p.price + 1.0),
+                            arrowprops=dict(arrowstyle="->", color="gray", lw=1.2))
+                n_shown_gray += 1
+        # else: hidden (highs during UP, lows during DOWN, UNK pivots)
 
     total = n_shown_black + n_shown_green + n_shown_red + n_shown_gray
     ax.set_title(
