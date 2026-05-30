@@ -328,7 +328,13 @@ if fire_2ES
 channel_overshoot_atr     = input.float(0.25, "Channel overshoot threshold (xATR)", minval=0.05, maxval=2.0, step=0.05, group="06 Channel filter")
 channel_breakout_atr      = input.float(0.25, "Channel breakout threshold (xATR)",  minval=0.05, maxval=2.0, step=0.05, group="06 Channel filter")
 channel_block_bars        = input.int(30, "Block opposite trades after overshoot (bars)", minval=1, maxval=200, group="06 Channel filter")
-channel_atr_prominence    = input.float(0.5, "Pivot prominence vs neighbors (xATR)", minval=0.0, maxval=3.0, step=0.1, tooltip="Pivot's high (or low) must stand out by at least this many ATRs from the highs (or lows) of neighboring bars on BOTH sides. Symmetric, no EMA dependency.", group="06 Channel filter")
+// NOTE: prominence default lowered from 0.5 to 0.10 xATR after Python/Yahoo
+// calibration on /ES 2-min RTH 2026-05-29. At 0.5xATR only ~5% of fractal
+// candidates passed (neighboring bar highs/lows are typically within a small
+// fraction of ATR of the swing extreme). 0.10xATR keeps ~50% of fractals,
+// then ZigZag confirmation does the noise-filtering work. See
+// `python/channels_yahoo_test.py` for the harness.
+channel_atr_prominence    = input.float(0.10, "Pivot prominence vs neighbors (xATR)", minval=0.0, maxval=3.0, step=0.05, tooltip="Pivot's high (or low) must stand out by at least this many ATRs from the highs (or lows) of neighboring bars on BOTH sides. 0.1 is calibrated for 2-min /ES; raise to 0.3-0.5 for higher TFs where bar-to-bar spreads are wider.", group="06 Channel filter")
 channel_atr_confirmation  = input.float(1.0, "Pivot confirmation reversal (xATR)", minval=0.1, maxval=5.0, step=0.1, tooltip="ZigZag-style: a candidate pivot is only confirmed after price moves this many ATRs in the OPPOSITE direction. Filters out 'looked like a pivot but wasn't' wiggles.", group="06 Channel filter")
 channel_min_pivots        = input.int(2, "Min pivots to form channel", minval=2, maxval=5, group="06 Channel filter")
 channel_max_pivots        = input.int(8, "Max pivots in rolling window", minval=2, maxval=20, tooltip="Older pivots beyond this count are evicted from the regression set.", group="06 Channel filter")
@@ -339,8 +345,8 @@ channel_pivot_strength    = input.int(3,  "Channel pivot strength (bars)", minva
 channel_method            = input.string("Andrews Pitchforks", "Channel method", options=["Andrews Pitchforks", "Convex Hull", "Linear Regression (legacy)"], tooltip="Andrews Pitchforks: one pitchfork per pivot-triple, accumulated (matches manual style with top/center/bottom lines). Convex Hull: single channel through extreme pivots. Linear Regression: legacy.", group="06 Channel filter")
 pitchfork_retrace_min     = input.float(0.236, "Pitchfork retracement min", minval=0.0, maxval=1.0, step=0.05, tooltip="Reject pitchforks where the 2nd leg retraces less than this fraction of leg 1.", group="06 Channel filter")
 pitchfork_retrace_max     = input.float(1.0,   "Pitchfork retracement max", minval=0.1, maxval=2.0, step=0.05, group="06 Channel filter")
-pitchfork_extend_bars     = input.int(25,  "Pitchfork extend forward (bars)", minval=5, maxval=200, group="06 Channel filter")
-pitchfork_max_count       = input.int(20,  "Max pitchforks on chart", minval=1, maxval=100, tooltip="Older pitchforks beyond this count are removed.", group="06 Channel filter")
+pitchfork_extend_bars     = input.int(60,  "Pitchfork extend forward (bars)", minval=5, maxval=200, tooltip="60 bars = 2 hrs on 2-min, 5 hrs on 5-min. Lower for less clutter.", group="06 Channel filter")
+pitchfork_max_count       = input.int(15,  "Max pitchforks on chart", minval=1, maxval=100, tooltip="Older pitchforks beyond this count are removed. Yahoo-test on 5/29 RTH (193 bars) produced 2-3 pitchforks per session, so 15 covers ~5 sessions.", group="06 Channel filter")
 
 atr14 = ta.atr(14)
 
@@ -422,8 +428,15 @@ var array<int>   pf_pivot_types  = array.new<int>(0)   // 1 = PH, -1 = PL
 var int          pf_last_drawn   = 0                   // count of pivots already used to draw a pitchfork
 var array<line>  pf_lines        = array.new<line>(0)  // historical pitchfork lines (3 per fork)
 
+// Note: Pine v5 evaluates both sides of `and` eagerly, so guarding
+// `array.last()` with a size check inline (`size > 0 and last() == ...`)
+// STILL crashes on empty arrays. Must nest the size check.
 if ph_qualifies
-    if array.size(pf_pivot_types) > 0 and array.last(pf_pivot_types) == 1
+    if array.size(pf_pivot_types) == 0
+        array.push(pf_pivot_prices, ph_value_final)
+        array.push(pf_pivot_bars,   ph_bar_final)
+        array.push(pf_pivot_types,  1)
+    else if array.last(pf_pivot_types) == 1
         // Replace last PH with higher one if applicable
         if ph_value_final > array.last(pf_pivot_prices)
             array.set(pf_pivot_prices, array.size(pf_pivot_prices) - 1, ph_value_final)
@@ -433,7 +446,11 @@ if ph_qualifies
         array.push(pf_pivot_bars,   ph_bar_final)
         array.push(pf_pivot_types,  1)
 if pl_qualifies
-    if array.size(pf_pivot_types) > 0 and array.last(pf_pivot_types) == -1
+    if array.size(pf_pivot_types) == 0
+        array.push(pf_pivot_prices, pl_value_final)
+        array.push(pf_pivot_bars,   pl_bar_final)
+        array.push(pf_pivot_types,  -1)
+    else if array.last(pf_pivot_types) == -1
         if pl_value_final < array.last(pf_pivot_prices)
             array.set(pf_pivot_prices, array.size(pf_pivot_prices) - 1, pl_value_final)
             array.set(pf_pivot_bars,   array.size(pf_pivot_bars)   - 1, pl_bar_final)
