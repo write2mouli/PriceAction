@@ -85,12 +85,19 @@ var float leg_extreme_l_price = na
 // Index in piv_* arrays of the pivot that started the CURRENT leg.
 var int   leg_start_pivot_idx = -1
 
-// Adaptive channel: lines being LIVE-updated during the current leg.
-// On TRANSITION the refs are set to na (orphaned), so the lines remain on
-// the chart as the historical channel for the leg that just ended and new
-// leg starts with fresh channel lines.
+// Adaptive channel: lines being LIVE-updated during the current epoch.
+// On CHoCH (Change of Character = any LL in UP or HH in DOWN) or TRANSITION,
+// the prior epoch's lines are DELETED and new lines start fresh. Old
+// channels don't accumulate on the chart -- only the active channel for
+// the current epoch is shown.
 var line  cur_leg_trendline = na    // chain line (HLs for UP, LHs for DOWN)
 var line  cur_leg_parallel  = na    // parallel through current extreme
+
+// Channel epoch start = pivot index where the CURRENT channel began.
+// Resets on CHoCH (Mouli: "as soon as character changes -- HL breached
+// and LL formed") or TRANSITION (full leg reversal). The epoch may start
+// mid-leg if the HL chain breaks even by a small amount.
+var int   channel_epoch_start_idx = -1
 
 // Counters
 var int n_hh = 0
@@ -482,19 +489,34 @@ if not na(ph_c_val)
     array.push(piv_leg_states, leg_state)
     if retro_idx >= 0
         retag_label(retro_idx, "TRANSITION")
-        // Orphan the completed leg's channel lines (they stay on chart as
-        // history; the new leg gets fresh live channel lines).
+        // Terminate the prior epoch's channel (delete -- no clutter accumulation)
+        if not na(cur_leg_trendline)
+            line.delete(cur_leg_trendline)
+        if not na(cur_leg_parallel)
+            line.delete(cur_leg_parallel)
         cur_leg_trendline := na
         cur_leg_parallel := na
         leg_start_pivot_idx := new_idx
+        channel_epoch_start_idx := new_idx
     else if legs_inc == 1
         leg_start_pivot_idx := new_idx
+        channel_epoch_start_idx := new_idx
+    // CHoCH (Change of Character): in DOWN leg, an HH (regardless of break
+    // size) breaks the LH chain -> new channel epoch starts.
+    if old_leg_dir_h == 2 and slab == "HH"
+        if not na(cur_leg_trendline)
+            line.delete(cur_leg_trendline)
+        if not na(cur_leg_parallel)
+            line.delete(cur_leg_parallel)
+        cur_leg_trendline := na
+        cur_leg_parallel := na
+        channel_epoch_start_idx := new_idx
     // Draw this pivot's label
     lab = draw_label_for(bx, bp, 1, slab, 1, leg_state)
     array.push(piv_labs, lab)
-    // Adaptive channel update for the active leg
+    // Adaptive channel update for the current epoch
     if leg_dir != 0
-        [new_tl, new_pl] = update_current_channel(leg_dir, leg_start_pivot_idx, cur_leg_trendline, cur_leg_parallel)
+        [new_tl, new_pl] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel)
         cur_leg_trendline := new_tl
         cur_leg_parallel := new_pl
 
@@ -532,15 +554,30 @@ if not na(pl_c_val)
     array.push(piv_leg_states, leg_state)
     if retro_idx >= 0
         retag_label(retro_idx, "TRANSITION")
+        if not na(cur_leg_trendline)
+            line.delete(cur_leg_trendline)
+        if not na(cur_leg_parallel)
+            line.delete(cur_leg_parallel)
         cur_leg_trendline := na
         cur_leg_parallel := na
         leg_start_pivot_idx := new_idx
+        channel_epoch_start_idx := new_idx
     else if legs_inc == 1
         leg_start_pivot_idx := new_idx
+        channel_epoch_start_idx := new_idx
+    // CHoCH: in UP leg, an LL (any size) breaks the HL chain -> new epoch
+    if old_leg_dir_l == 1 and slab == "LL"
+        if not na(cur_leg_trendline)
+            line.delete(cur_leg_trendline)
+        if not na(cur_leg_parallel)
+            line.delete(cur_leg_parallel)
+        cur_leg_trendline := na
+        cur_leg_parallel := na
+        channel_epoch_start_idx := new_idx
     lab = draw_label_for(bx, bp, -1, slab, 1, leg_state)
     array.push(piv_labs, lab)
     if leg_dir != 0
-        [new_tl, new_pl] = update_current_channel(leg_dir, leg_start_pivot_idx, cur_leg_trendline, cur_leg_parallel)
+        [new_tl, new_pl] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel)
         cur_leg_trendline := new_tl
         cur_leg_parallel := new_pl
 
