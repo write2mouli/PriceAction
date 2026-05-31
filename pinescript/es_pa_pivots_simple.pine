@@ -29,7 +29,7 @@
 //
 // Structural label (HH/HL/LH/LL) is still computed per pivot relative to the
 // most recent same-kind pivot, and shown as text. The COLOR comes from the
-// leg state, not the structural label.
+// leg state, not the slabural label.
 // ============================================================================
 
 indicator("ES PA Pivots Simple", overlay=true, max_labels_count=500)
@@ -66,7 +66,7 @@ var array<int>    piv_bars       = array.new<int>(0)
 var array<float>  piv_prices     = array.new<float>(0)
 var array<int>    piv_kinds      = array.new<int>(0)     // 1=H, -1=L
 var array<int>    piv_grades     = array.new<int>(0)     // 1=C, 2=B, 3=A
-var array<string> piv_structs    = array.new<string>(0)  // HH/HL/LH/LL/?
+var array<string> piv_slabs    = array.new<string>(0)  // HH/HL/LH/LL/?
 var array<string> piv_leg_states = array.new<string>(0)  // EXTEND/IN_RANGE/TRANSITION/INIT
 var array<label>  piv_labs       = array.new<label>(0)
 
@@ -108,19 +108,19 @@ color_for_leg_state(leg_state) =>
         out_c := color.red
     out_c
 
-color_for_struct(struct) =>
-    struct == "HH" or struct == "HL" ? color.green : struct == "LH" or struct == "LL" ? color.red : color.gray
+color_for_slab(slab) =>
+    slab == "HH" or slab == "HL" ? color.green : slab == "LH" or slab == "LL" ? color.red : color.gray
 
 text_style_for_kind(kind) =>
     kind == 1 ? label.style_label_down : label.style_label_up
 
-// Draw label using leg state OR structural color, per user toggle
-draw_label_for(bx, bp, kind, struct, grade, leg_state) =>
-    c = use_leg_color ? color_for_leg_state(leg_state) : color_for_struct(struct)
+// Draw label using leg state OR slabural color, per user toggle
+draw_label_for(bx, bp, kind, slab, grade, leg_state) =>
+    c = use_leg_color ? color_for_leg_state(leg_state) : color_for_slab(slab)
     if show_for_grade(grade)
         sz = size_for_grade(grade)
         style = text_style_for_kind(kind)
-        txt = show_labels ? struct : ""
+        txt = show_labels ? slab : ""
         label.new(bx, bp, txt, color=color.new(c, 70), textcolor=c, style=style, size=sz)
     else
         label.new(bx, bp, "", color=color.new(color.gray, 100), style=label.style_none, size=size.tiny)
@@ -180,8 +180,8 @@ process_leg(price, kind, pivot_idx) =>
                         ex_bp = array.get(piv_prices, prev_extreme_idx)
                         ex_kind = array.get(piv_kinds, prev_extreme_idx)
                         ex_grade = array.get(piv_grades, prev_extreme_idx)
-                        ex_struct = array.get(piv_structs, prev_extreme_idx)
-                        new_lab = draw_label_for(ex_bx, ex_bp, ex_kind, ex_struct, ex_grade, "TRANSITION")
+                        ex_slab = array.get(piv_slabs, prev_extreme_idx)
+                        new_lab = draw_label_for(ex_bx, ex_bp, ex_kind, ex_slab, ex_grade, "TRANSITION")
                         array.set(piv_labs, prev_extreme_idx, new_lab)
                         array.set(piv_leg_states, prev_extreme_idx, "TRANSITION")
     else if leg_dir == 2
@@ -211,28 +211,28 @@ process_leg(price, kind, pivot_idx) =>
                         ex_bp = array.get(piv_prices, prev_extreme_idx)
                         ex_kind = array.get(piv_kinds, prev_extreme_idx)
                         ex_grade = array.get(piv_grades, prev_extreme_idx)
-                        ex_struct = array.get(piv_structs, prev_extreme_idx)
-                        new_lab = draw_label_for(ex_bx, ex_bp, ex_kind, ex_struct, ex_grade, "TRANSITION")
+                        ex_slab = array.get(piv_slabs, prev_extreme_idx)
+                        new_lab = draw_label_for(ex_bx, ex_bp, ex_kind, ex_slab, ex_grade, "TRANSITION")
                         array.set(piv_labs, prev_extreme_idx, new_lab)
                         array.set(piv_leg_states, prev_extreme_idx, "TRANSITION")
     out
 
 // Register a brand-new pivot (smallest grade)
 register_new_pivot(bx, bp, kind) =>
-    struct = ""
+    slab = ""
     if kind == 1
-        struct := na(last_h_price) ? "?" : (bp > last_h_price ? "HH" : "LH")
+        slab := na(last_h_price) ? "?" : (bp > last_h_price ? "HH" : "LH")
         last_h_price := bp
     else
-        struct := na(last_l_price) ? "?" : (bp < last_l_price ? "LL" : "HL")
+        slab := na(last_l_price) ? "?" : (bp < last_l_price ? "LL" : "HL")
         last_l_price := bp
-    if struct == "HH"
+    if slab == "HH"
         n_hh := n_hh + 1
-    else if struct == "HL"
+    else if slab == "HL"
         n_hl := n_hl + 1
-    else if struct == "LH"
+    else if slab == "LH"
         n_lh := n_lh + 1
-    else if struct == "LL"
+    else if slab == "LL"
         n_ll := n_ll + 1
     else
         n_q := n_q + 1
@@ -241,11 +241,11 @@ register_new_pivot(bx, bp, kind) =>
     array.push(piv_prices, bp)
     array.push(piv_kinds, kind)
     array.push(piv_grades, 1)
-    array.push(piv_structs, struct)
+    array.push(piv_slabs, slab)
     new_idx = array.size(piv_bars) - 1
     leg_state = process_leg(bp, kind, new_idx)
     array.push(piv_leg_states, leg_state)
-    lab = draw_label_for(bx, bp, kind, struct, 1, leg_state)
+    lab = draw_label_for(bx, bp, kind, slab, 1, leg_state)
     array.push(piv_labs, lab)
 
 // Find the most recent pivot of (bar, kind) and upgrade its grade
@@ -273,10 +273,10 @@ upgrade_pivot(bx, kind, new_grade) =>
                 array.set(piv_grades, found, new_grade)
                 old_lab = array.get(piv_labs, found)
                 label.delete(old_lab)
-                struct = array.get(piv_structs, found)
+                slab = array.get(piv_slabs, found)
                 bp = array.get(piv_prices, found)
                 leg_state = array.get(piv_leg_states, found)
-                new_lab = draw_label_for(bx, bp, kind, struct, new_grade, leg_state)
+                new_lab = draw_label_for(bx, bp, kind, slab, new_grade, leg_state)
                 array.set(piv_labs, found, new_lab)
 
 // === Process detections this bar ===========================================
