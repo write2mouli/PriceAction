@@ -373,7 +373,8 @@ def _band_robust(slope, pivs: List[Piv], direction, top_pct):
 
 
 def _emit_robust(segs, seg_chain, leg_pivs, direction, top_pct, c, n,
-                 atr_v=None, margin_atr=0.25, min_move_atr=0.0, min_grade=1):
+                 atr_v=None, margin_atr=0.25, min_move_atr=0.0, min_grade=1,
+                 trend_anom=0):
     """Robust band + extend the channel to the right until a bar CLOSES beyond
     the trend-side line by a CLEAN-break margin (UP: close < support - margin /
     DOWN: close > resistance + margin). The margin stops normal bounces from
@@ -407,10 +408,12 @@ def _emit_robust(segs, seg_chain, leg_pivs, direction, top_pct, c, n,
     # below, extend until lower line is breached"). Opposite rail = max-touch over
     # MAJOR pivots, <=2 anomalies.
     if direction == 1:
-        sup_b = min(lo_all)
+        # trend-side (support): exact lowest low, OR ride the low cluster letting
+        # <=trend_anom deepest wicks poke below (less undershoot, cleaner line).
+        sup_b = -_best_offset([-r for r in lo_all], tol, trend_anom) if trend_anom > 0 else min(lo_all)
         res_b = _best_offset(hi_maj, tol, 2)
     else:
-        res_b = max(hi_all)
+        res_b = _best_offset(hi_all, tol, trend_anom) if trend_anom > 0 else max(hi_all)
         sup_b = -_best_offset([-r for r in lo_maj], tol, 2)
     x1e = n - 1
     for b in range(x1 + 1, n):
@@ -424,7 +427,7 @@ def _emit_robust(segs, seg_chain, leg_pivs, direction, top_pct, c, n,
 
 def method_piecewise_robust(legs, pivs, h, l, c, min_grade, atr_v,
                             tol_atr=1.2, top_pct=85, margin_atr=0.25,
-                            min_move_atr=0.0) -> List[ChannelSeg]:
+                            min_move_atr=0.0, trend_anom=0) -> List[ChannelSeg]:
     """method F + robust trimmed band + extend-until-support-break + optional
     trend-quality filter (min_move_atr)."""
     n = len(h)
@@ -446,13 +449,13 @@ def method_piecewise_robust(legs, pivs, h, l, c, min_grade, atr_v,
                                                for x, y in zip(xs, ys))
             if m is not None and maxres > tol and (i - 1) - seg_start >= 2:
                 _emit_robust(segs, cp[seg_start:i - 1], pivs, lg.direction,
-                             top_pct, c, n, atr_v, margin_atr, min_move_atr, min_grade)
+                             top_pct, c, n, atr_v, margin_atr, min_move_atr, min_grade, trend_anom)
                 seg_start = i - 2
                 i = seg_start + 2
             else:
                 i += 1
         _emit_robust(segs, cp[seg_start:], pivs, lg.direction, top_pct, c, n,
-                     atr_v, margin_atr, min_move_atr, min_grade)
+                     atr_v, margin_atr, min_move_atr, min_grade, trend_anom)
     # Clean handoff: a channel stops where the next one starts (or earlier, at
     # its own support break). Prevents many channels all running to session end.
     segs.sort(key=lambda s: s.x0)
@@ -848,12 +851,10 @@ def main():
          method_spike_and_channel(legs, pivs, h, l, 3, atr_v, 0.75)),
         ("F_piecewise_regression tol1.2 (spike->grind split)",
          method_piecewise_regression(legs, pivs, h, l, 3, atr_v, 1.2)),
-        ("J_fit1.2 (splits grind)",
-         method_piecewise_robust(legs, pivs, h, l, c, 3, atr_v, 1.2, 85, 0.25, 2.5)),
-        ("P_fit2.5 (grind stays one channel)",
-         method_piecewise_robust(legs, pivs, h, l, c, 3, atr_v, 2.5, 85, 0.25, 2.5)),
-        ("Q_fit3.5 (loosest)",
-         method_piecewise_robust(legs, pivs, h, l, c, 3, atr_v, 3.5, 85, 0.25, 2.5)),
+        ("P_fit2.5 exact support (current)",
+         method_piecewise_robust(legs, pivs, h, l, c, 3, atr_v, 2.5, 85, 0.25, 2.5, 0)),
+        ("R_fit2.5 support rides cluster (<=2 undershoot)",
+         method_piecewise_robust(legs, pivs, h, l, c, 3, atr_v, 2.5, 85, 0.25, 2.5, 2)),
     ]
     # touch-count diagnostic: lower/upper pivot touches per channel
     for label, segs in methods:

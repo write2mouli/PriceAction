@@ -52,7 +52,8 @@ major_min_grade = input.int(3, "Major: min pivot grade for channel touches (3=A,
 major_break_atr = input.float(2.0, "Major: break threshold (xATR)", minval=0.25, maxval=8.0, step=0.25, tooltip="Higher = fewer, broader major legs. A major leg only reverses when a Grade-A pivot breaks its HL/LH chain by this many ATRs. Raise it if the trend keeps flipping UP/DOWN on pullbacks (opposite-color channels crossing).", group="Major channels")
 major_keep = input.int(24, "Major: keep only the last N channels", minval=1, maxval=200, tooltip="Caps how many finalized major channels stay on the chart, so they don't pile up infinitely across all loaded history. With ~6-8 clean channels per day, 24 keeps roughly the last 3 trading days. Raise it to see more history; lower it to declutter when zoomed in.", group="Major channels")
 major_min_move_atr = input.float(2.5, "Major: min trend move to draw a channel (xATR)", minval=0.0, maxval=15.0, step=0.5, tooltip="Trend-quality filter. A segment only draws a channel once its net directional travel (|slope x span|) reaches this many ATRs. Chop goes nowhere, so it stays blank -- the channel emerges progressively as a real trend develops. Raise it to suppress more chop / only show strong trends; 0 disables the filter.", group="Major channels")
-major_touch_atr = input.float(0.4, "Major: pivot touch tolerance (xATR)", minval=0.05, maxval=2.0, step=0.05, tooltip="How close a pivot must sit to a rail to count as a TOUCH. The trend-side rail is the exact extreme (touches the lowest low / highest high); the opposite rail's offset is chosen to land on the MOST pivots within this tolerance while letting at most 2 poke out as anomalies.", group="Major channels")
+major_touch_atr = input.float(0.4, "Major: pivot touch tolerance (xATR)", minval=0.05, maxval=2.0, step=0.05, tooltip="How close a pivot must sit to a rail to count as a TOUCH. Each rail's offset is chosen to land on the MOST pivots within this tolerance while letting at most 2 poke out as anomalies, so the support (UP) / resistance (DOWN) rides the pivot cluster cleanly.", group="Major channels")
+show_breach = input.bool(true, "Mark support/resistance breach", tooltip="For an uptrend the channel is about the SUPPORT and its BREACH: mark an X at the bar where price first CLOSES below support (UP) / above resistance (DOWN), which is where the channel ends.", group="Major channels")
 major_width = input.int(3, "Major: line width (px)", minval=1, maxval=6, group="Major channels")
 major_fit_atr = input.float(2.5, "Major: regression fit tolerance (xATR)", minval=0.25, maxval=8.0, step=0.1, tooltip="Piecewise regression (spike-and-channel). A segment splits only when its support-pivot regression stops fitting by this many ATRs -- so a BIG slope change (spike->grind) splits, but the grind's minor wiggles do NOT, keeping a trend as ONE long channel. Lower it to split more readily; raise it for fewer, longer channels.", group="Major channels")
 major_break_margin_atr = input.float(0.25, "Major: clean-break margin (xATR)", minval=0.0, maxval=2.0, step=0.05, tooltip="A channel ends only when a bar CLOSES beyond its trend-side line (support for UP / resistance for DOWN) by at least this many ATRs -- a CLEAN break, not a marginal poke. Raise it if downtrends fragment into many short channels because normal bounces nick the resistance.", group="Major channels")
@@ -744,11 +745,22 @@ update_current_channel(leg_direction, leg_start_idx, cur_chain, cur_par, cur_cen
                 if maj
                     tol_t = major_touch_atr * (na(atr14) ? 0.0 : atr14)
                     if leg_direction == 1
-                        bo = best_offset_for(leg_start_idx, slope, min_grade, 1, tol_t, 2, true)
-                        r_max := na(bo) ? rmax1 : bo          // upper: max-touch, <=2 above
+                        // SUPPORT (trend-side, THE line): ride the low CLUSTER over
+                        // all grades, letting the <=2 deepest wicks poke below as
+                        // anomalies -- clean, less undershoot. Its breach (a close
+                        // below it) is what ends the uptrend.
+                        boL = best_offset_for(leg_start_idx, slope, 1, -1, tol_t, 2, false)
+                        r_min := na(boL) ? rmin1 : boL
+                        // upper rail (context): max-touch over major highs, <=2 above
+                        boU = best_offset_for(leg_start_idx, slope, min_grade, 1, tol_t, 2, true)
+                        r_max := na(boU) ? rmax1 : boU
                     else
-                        bo = best_offset_for(leg_start_idx, slope, min_grade, -1, tol_t, 2, false)
-                        r_min := na(bo) ? rmin1 : bo          // support: max-touch, <=2 below
+                        // RESISTANCE (trend-side, THE line): ride the high cluster,
+                        // <=2 above; its breach (close above) ends the downtrend.
+                        boU = best_offset_for(leg_start_idx, slope, 1, 1, tol_t, 2, true)
+                        r_max := na(boU) ? rmax1 : boU
+                        boL = best_offset_for(leg_start_idx, slope, min_grade, -1, tol_t, 2, false)
+                        r_min := na(boL) ? rmin1 : boL
                 left_x  = array.get(piv_bars, leg_start_idx)
                 right_x = bar_index
                 up_yL = slope * left_x  + r_max
@@ -1206,6 +1218,10 @@ if show_major and not na(m_chain) and m_leg_dir != 0
     mgn = major_break_margin_atr * (na(atr14) ? 0.0 : atr14)
     broke = m_leg_dir == 1 ? close < trend_y_now - mgn : close > trend_y_now + mgn
     if broke
+        // Mark the breach: this is the signal an uptrend's SUPPORT (or a
+        // downtrend's resistance) was closed through -- where the channel ends.
+        if show_breach
+            label.new(bar_index, close, "X", style=(m_leg_dir == 1 ? label.style_label_up : label.style_label_down), color=color.new(color.fuchsia, 0), textcolor=color.white, size=size.small)
         register_major(m_chain, m_par, m_cen, bar_index)
         m_chain := na
         m_par   := na
