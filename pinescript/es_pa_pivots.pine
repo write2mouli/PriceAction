@@ -30,7 +30,7 @@
 // Validation: /ES 2m 5/29 RTH -> 5 BLACK at ~10:00 / 10:44 / 12:40 / 14:00 / 15:42
 // ============================================================================
 
-indicator("ES PA Pivots", overlay=true, max_lines_count=500)
+indicator("ES PA Pivots", overlay=true, max_lines_count=500, max_labels_count=500)
 
 // Inputs ---------------------------------------------------------------------
 strength      = input.int(2,   "Pivot strength (bars each side)", minval=1, maxval=10, group="Pivot")
@@ -42,8 +42,9 @@ show_gray_strong = input.bool(true, "Show STRONG gray warnings (LL in UP / HH in
 show_gray_weak   = input.bool(true, "Show WEAK gray warnings (break < threshold, still in range)", group="Display")
 show_ema      = input.bool(true,  "Show EMA21", group="Display")
 ema_length    = input.int(21, "EMA length", minval=5, maxval=200, group="Display")
-black_marker_height_atr = input.float(0.4, "BLACK marker height (xATR)", minval=0.05, maxval=2.0, step=0.05, group="Display")
-black_marker_width = input.int(3, "BLACK marker line width", minval=1, maxval=8, group="Display")
+black_marker_height_atr = input.float(0.8, "BLACK marker height (xATR)", minval=0.05, maxval=3.0, step=0.05, tooltip="Vertical line length above (for top) or below (for bottom) the pivot price.", group="Display")
+black_marker_width = input.int(5, "BLACK marker line width", minval=1, maxval=10, group="Display")
+black_horiz_bars = input.int(2, "BLACK horizontal cap width (bars)", minval=0, maxval=10, tooltip="Adds a horizontal cap line at the pivot price. 0 = no cap (vertical line only).", group="Display")
 
 // ATR + EMA -----------------------------------------------------------------
 atr14 = ta.atr(14)
@@ -107,7 +108,9 @@ push_alt(p, b, kind) =>
             out_idx := array.size(piv_t) - 1
     out_idx
 
-// Draw BLACK vertical line at a past pivot
+// Draw BLACK marker at a past pivot. Vertical line + optional horizontal
+// cap line at the pivot price level (looks like a T or flag pole, very
+// distinct from any arrow shape).
 draw_black(arr_idx, kind) =>
     if arr_idx >= 0
         if arr_idx < array.size(piv_b)
@@ -118,6 +121,32 @@ draw_black(arr_idx, kind) =>
             y_bottom = kind == 1 ? bp      : bp - ah
             if show_black
                 line.new(bx, y_bottom, bx, y_top, color=color.black, width=black_marker_width, style=line.style_solid)
+                // Optional horizontal cap line at the pivot price
+                if black_horiz_bars > 0
+                    line.new(bx - black_horiz_bars, bp, bx + black_horiz_bars, bp, color=color.black, width=black_marker_width, style=line.style_solid)
+
+// Retroactive GREEN low arrow at a past low pivot (used when PEND_UP -> UP
+// confirms; intermediate HLs become tradeable in hindsight).
+draw_retro_green_l(arr_idx) =>
+    if arr_idx >= 0
+        if arr_idx < array.size(piv_b)
+            kind_k = array.get(piv_t, arr_idx)
+            if kind_k == -1
+                if show_green
+                    bx = array.get(piv_b, arr_idx)
+                    bp = array.get(piv_p, arr_idx)
+                    label.new(bx, bp, "", color=color.green, style=label.style_arrowup, textcolor=color.green, size=size.normal)
+
+// Retroactive RED high arrow at a past high pivot (PEND_DOWN -> DOWN).
+draw_retro_red_h(arr_idx) =>
+    if arr_idx >= 0
+        if arr_idx < array.size(piv_b)
+            kind_k = array.get(piv_t, arr_idx)
+            if kind_k == 1
+                if show_red
+                    bx = array.get(piv_b, arr_idx)
+                    bp = array.get(piv_p, arr_idx)
+                    label.new(bx, bp, "", color=color.red, style=label.style_arrowdown, textcolor=color.red, size=size.normal)
 
 // === On new HIGH pivot =====================================================
 if new_ph
@@ -146,6 +175,13 @@ if new_ph
             if not na(extreme_h_i)
                 if extreme_h_i != idx_h
                     draw_black(extreme_h_i, 1)
+                    // Retroactive RED: any HIGH pivots between BLACK top and
+                    // this confirming LH become RED highs in the new DOWN trend
+                    retro_from_h = extreme_h_i + 1
+                    retro_to_h = idx_h
+                    if retro_to_h > retro_from_h
+                        for k_h = retro_from_h to retro_to_h - 1
+                            draw_retro_red_h(k_h)
             tstate := 2
             extreme_h_p := na
             extreme_h_i := na
@@ -195,6 +231,13 @@ if new_pl
             if not na(extreme_l_i)
                 if extreme_l_i != idx_l
                     draw_black(extreme_l_i, -1)
+                    // Retroactive GREEN: any LOW pivots between BLACK bottom
+                    // and this confirming HL become GREEN HLs in new UP trend
+                    retro_from_l = extreme_l_i + 1
+                    retro_to_l = idx_l
+                    if retro_to_l > retro_from_l
+                        for k_l = retro_from_l to retro_to_l - 1
+                            draw_retro_green_l(k_l)
             tstate := 1
             extreme_l_p := na
             extreme_l_i := na
