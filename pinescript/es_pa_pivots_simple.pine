@@ -254,7 +254,7 @@ compute_leg_state(price, kind, slab, pivot_idx, cur_dir, cur_last_hl, cur_last_l
 // that exists BEFORE the given pivot index. Returns na if none exists.
 // Ascending loop overwrites on each match, so final value is the latest.
 find_prev_significant_price(pivot_idx, kind, min_grade) =>
-    result = na
+    float result = na
     if pivot_idx > 0
         for i = 0 to pivot_idx - 1
             cand_kind = array.get(piv_kinds, i)
