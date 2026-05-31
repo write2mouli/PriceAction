@@ -302,8 +302,12 @@ thr = na(atr14) ? 0.0 : atr14 * leg_break_atr
 if not na(ph_c_val)
     bx = bar_index - strength_c
     bp = ph_c_val
-    // Structural label
-    slab = na(last_h_price) ? "?" : (bp > last_h_price ? "HH" : "LH")
+    // Slab uses the LEG'S structural reference when in a trend:
+    //   - DOWN leg: compare to last_lh_price (the leg's resistance level)
+    //   - INIT or UP leg: compare to immediate prior high
+    // This way an isolated noisy spike won't flip a real LH into HH.
+    ref_h = leg_dir == 2 and not na(last_lh_price) ? last_lh_price : last_h_price
+    slab = na(ref_h) ? "?" : (bp > ref_h ? "HH" : "LH")
     last_h_price := bp
     // Counters
     if slab == "HH"
@@ -341,7 +345,9 @@ if not na(ph_c_val)
 if not na(pl_c_val)
     bx = bar_index - strength_c
     bp = pl_c_val
-    slab = na(last_l_price) ? "?" : (bp < last_l_price ? "LL" : "HL")
+    // In UP leg: compare to last_hl_price (the leg's support). Else: prior fractal.
+    ref_l = leg_dir == 1 and not na(last_hl_price) ? last_hl_price : last_l_price
+    slab = na(ref_l) ? "?" : (bp < ref_l ? "LL" : "HL")
     last_l_price := bp
     if slab == "HL"
         n_hl := n_hl + 1
