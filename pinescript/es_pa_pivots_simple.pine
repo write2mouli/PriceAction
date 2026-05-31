@@ -1,27 +1,35 @@
 //@version=5
-// ES PA Pivots SIMPLE - graded pivot detection
+// ES PA Pivots SIMPLE - graded pivots + leg detection
 // ============================================================================
-// Every pivot is graded A / B / C by how wide a window it dominates:
-//   Grade C: strength_c bars each side (default 1, the basic 3-bar fractal)
-//   Grade B: strength_b bars each side (default 3 = 7-bar fractal)
-//   Grade A: strength_a bars each side (default 5 = 11-bar fractal)
+// Step 1 of channel work: identify legs from pivots.
 //
-// A pivot starts at Grade C when the smallest-window check confirms it.
-// It gets UPGRADED to B when the wider check fires for the same bar,
-// then to A when the widest fires. Grade reflects how isolated / important
-// the swing is -- A pivots anchor major channels, C pivots fill minor ones.
+// A LEG is a directional move with a known range [anchor, extreme]:
+//   - UP leg:   anchor = leg-start LOW,  extreme = highest H since anchor
+//   - DOWN leg: anchor = leg-start HIGH, extreme = lowest L since anchor
 //
-// Each pivot also gets a structural label HH / HL / LH / LL relative to
-// the prior same-kind pivot (Grade A vs C don't affect classification,
-// only marker size). First pivot is "?" (no prior).
+// Each new pivot gets one of:
+//   EXTEND      -- extends the current leg's extreme (HH in UP, LL in DOWN)
+//                  GREEN in UP, RED in DOWN
+//   IN_RANGE    -- price is between anchor and extreme (consolidation /
+//                  pullback / counter-wiggle that stays within the leg)
+//                  GRAY
+//   TRANSITION  -- breaks beyond the leg's anchor by at least leg_break_atr*ATR
+//                  -> ends the current leg, starts the opposite-direction leg
+//                  BLACK on the breaking pivot AND retroactively on the prior
+//                  leg's extreme (so each finished leg has two black bookends)
+//   INIT        -- before the first leg direction is established
+//                  GRAY
 //
-// Display:
-//   Grade A pivots -> size.large arrow + label
-//   Grade B        -> size.normal
-//   Grade C        -> size.small (or hidden via toggle)
-//   Color:  HH / HL -> green   (bullish / holding above prior low)
-//           LH / LL -> red     (bearish / breaking prior low)
-//           ?       -> gray
+// Pivot grading (multi-strength fractal):
+//   Grade C (default 1 bar each side)  = base detection, 3-bar fractal
+//   Grade B (default 3 bars each side) = upgrade
+//   Grade A (default 5 bars each side) = highest grade
+// Higher grade = bigger marker. A pivot starts at C and gets upgraded if a
+// wider fractal fires for the same bar.
+//
+// Structural label (HH/HL/LH/LL) is still computed per pivot relative to the
+// most recent same-kind pivot, and shown as text. The COLOR comes from the
+// leg state, not the structural label.
 // ============================================================================
 
 indicator("ES PA Pivots Simple", overlay=true, max_labels_count=500)
@@ -37,7 +45,11 @@ show_grade_c = input.bool(false, "Show Grade C (minor)",  group="Display")
 show_labels  = input.bool(true,  "Show HH/HL/LH/LL text labels", group="Display")
 show_ema     = input.bool(true,  "Show EMA21", group="Display")
 
-// EMA ------------------------------------------------------------------------
+leg_break_atr = input.float(0.5, "Leg break threshold (xATR)", minval=0.0, maxval=3.0, step=0.05, tooltip="A pivot must break beyond the leg anchor by this many ATRs to count as a TRANSITION. 0 = any break flips the leg.", group="Legs")
+use_leg_color = input.bool(true, "Color pivots by leg state (instead of HH/HL/LH/LL)", group="Legs")
+
+// EMA + ATR ------------------------------------------------------------------
+atr14 = ta.atr(14)
 ema21 = ta.ema(close, 21)
 plot(show_ema ? ema21 : na, "EMA21", color=color.blue, linewidth=1)
 
@@ -49,18 +61,26 @@ pl_c_val = ta.pivotlow(low,  strength_c, strength_c)
 pl_b_val = ta.pivotlow(low,  strength_b, strength_b)
 pl_a_val = ta.pivotlow(low,  strength_a, strength_a)
 
-// Tracking arrays (one slot per pivot, parallel arrays) ----------------------
-var array<int>    piv_bars    = array.new<int>(0)
-var array<float>  piv_prices  = array.new<float>(0)
-var array<int>    piv_kinds   = array.new<int>(0)     // 1=H, -1=L
-var array<int>    piv_grades  = array.new<int>(0)     // 1=C, 2=B, 3=A
-var array<string> piv_structs = array.new<string>(0)  // HH/HL/LH/LL/?
-var array<label>  piv_labs    = array.new<label>(0)
+// Per-pivot tracking arrays --------------------------------------------------
+var array<int>    piv_bars       = array.new<int>(0)
+var array<float>  piv_prices     = array.new<float>(0)
+var array<int>    piv_kinds      = array.new<int>(0)     // 1=H, -1=L
+var array<int>    piv_grades     = array.new<int>(0)     // 1=C, 2=B, 3=A
+var array<string> piv_structs    = array.new<string>(0)  // HH/HL/LH/LL/?
+var array<string> piv_leg_states = array.new<string>(0)  // EXTEND/IN_RANGE/TRANSITION/INIT
+var array<label>  piv_labs       = array.new<label>(0)
 
 var float last_h_price = na
 var float last_l_price = na
 
-// Counters for the status table
+// Leg state ------------------------------------------------------------------
+// 0 = INIT, 1 = UP leg, 2 = DOWN leg
+var int   leg_dir         = 0
+var float leg_anchor      = na   // start price of current leg
+var float leg_extreme     = na   // farthest price in current direction
+var int   leg_extreme_idx = -1   // index in piv_* of the extreme pivot
+
+// Counters
 var int n_hh = 0
 var int n_hl = 0
 var int n_lh = 0
@@ -69,36 +89,135 @@ var int n_q  = 0
 var int n_a  = 0
 var int n_b  = 0
 var int n_c  = 0
+var int n_legs = 0
 
-// Helper: pick size constant per grade
+// Display helpers ------------------------------------------------------------
 size_for_grade(grade) =>
     grade == 3 ? size.large : grade == 2 ? size.normal : size.small
 
-// Helper: should this grade be displayed?
 show_for_grade(grade) =>
     grade == 3 ? show_grade_a : grade == 2 ? show_grade_b : show_grade_c
 
-// Helper: color by struct
+color_for_leg_state(leg_state) =>
+    out_c = color.gray
+    if leg_state == "TRANSITION"
+        out_c := color.black
+    else if leg_state == "EXTEND_UP"
+        out_c := color.green
+    else if leg_state == "EXTEND_DN"
+        out_c := color.red
+    out_c
+
 color_for_struct(struct) =>
     struct == "HH" or struct == "HL" ? color.green : struct == "LH" or struct == "LL" ? color.red : color.gray
 
-// Helper: text-label style by kind (high vs low)
 text_style_for_kind(kind) =>
     kind == 1 ? label.style_label_down : label.style_label_up
 
-// Draw (or redraw on upgrade) the label for a pivot. Returns the label ref.
-draw_label_for(bx, bp, kind, struct, grade) =>
-    c = color_for_struct(struct)
+// Draw label using leg state OR structural color, per user toggle
+draw_label_for(bx, bp, kind, struct, grade, leg_state) =>
+    c = use_leg_color ? color_for_leg_state(leg_state) : color_for_struct(struct)
     if show_for_grade(grade)
         sz = size_for_grade(grade)
         style = text_style_for_kind(kind)
         txt = show_labels ? struct : ""
         label.new(bx, bp, txt, color=color.new(c, 70), textcolor=c, style=style, size=sz)
     else
-        // Hidden placeholder so the array index stays in sync
         label.new(bx, bp, "", color=color.new(color.gray, 100), style=label.style_none, size=size.tiny)
 
-// Register a brand-new pivot at Grade C (smallest window first hit)
+// Compute leg state for a new pivot, mutating leg_dir / leg_anchor / etc.
+// Returns the leg_state string for this pivot.
+// `pivot_idx` is the index in piv_* arrays where this pivot was just pushed.
+process_leg(price, kind, pivot_idx) =>
+    out = "INIT"
+    thr = na(atr14) ? 0.0 : atr14 * leg_break_atr
+    if leg_dir == 0
+        if na(leg_anchor)
+            leg_anchor := price
+            out := "INIT"
+        else
+            if price > leg_anchor + thr
+                leg_dir := 1
+                leg_extreme := price
+                leg_extreme_idx := pivot_idx
+                out := "EXTEND_UP"
+                n_legs := n_legs + 1
+            else if price < leg_anchor - thr
+                leg_dir := 2
+                leg_extreme := price
+                leg_extreme_idx := pivot_idx
+                out := "EXTEND_DN"
+                n_legs := n_legs + 1
+            else
+                out := "IN_RANGE"
+    else if leg_dir == 1
+        if kind == 1
+            if price > leg_extreme
+                leg_extreme := price
+                leg_extreme_idx := pivot_idx
+                out := "EXTEND_UP"
+            else
+                out := "IN_RANGE"
+        else
+            if price > leg_anchor - thr
+                out := "IN_RANGE"
+            else
+                out := "TRANSITION"
+                // The prior leg_extreme becomes the END of the up leg. Mark it.
+                prev_extreme_idx = leg_extreme_idx
+                // Start new DOWN leg
+                leg_dir := 2
+                leg_anchor := array.get(piv_prices, prev_extreme_idx)
+                leg_extreme := price
+                leg_extreme_idx := pivot_idx
+                n_legs := n_legs + 1
+                // Retroactively re-label the prior extreme as TRANSITION
+                if prev_extreme_idx >= 0
+                    if prev_extreme_idx < array.size(piv_labs)
+                        old_lab = array.get(piv_labs, prev_extreme_idx)
+                        label.delete(old_lab)
+                        ex_bx = array.get(piv_bars, prev_extreme_idx)
+                        ex_bp = array.get(piv_prices, prev_extreme_idx)
+                        ex_kind = array.get(piv_kinds, prev_extreme_idx)
+                        ex_grade = array.get(piv_grades, prev_extreme_idx)
+                        ex_struct = array.get(piv_structs, prev_extreme_idx)
+                        new_lab = draw_label_for(ex_bx, ex_bp, ex_kind, ex_struct, ex_grade, "TRANSITION")
+                        array.set(piv_labs, prev_extreme_idx, new_lab)
+                        array.set(piv_leg_states, prev_extreme_idx, "TRANSITION")
+    else if leg_dir == 2
+        if kind == -1
+            if price < leg_extreme
+                leg_extreme := price
+                leg_extreme_idx := pivot_idx
+                out := "EXTEND_DN"
+            else
+                out := "IN_RANGE"
+        else
+            if price < leg_anchor + thr
+                out := "IN_RANGE"
+            else
+                out := "TRANSITION"
+                prev_extreme_idx = leg_extreme_idx
+                leg_dir := 1
+                leg_anchor := array.get(piv_prices, prev_extreme_idx)
+                leg_extreme := price
+                leg_extreme_idx := pivot_idx
+                n_legs := n_legs + 1
+                if prev_extreme_idx >= 0
+                    if prev_extreme_idx < array.size(piv_labs)
+                        old_lab = array.get(piv_labs, prev_extreme_idx)
+                        label.delete(old_lab)
+                        ex_bx = array.get(piv_bars, prev_extreme_idx)
+                        ex_bp = array.get(piv_prices, prev_extreme_idx)
+                        ex_kind = array.get(piv_kinds, prev_extreme_idx)
+                        ex_grade = array.get(piv_grades, prev_extreme_idx)
+                        ex_struct = array.get(piv_structs, prev_extreme_idx)
+                        new_lab = draw_label_for(ex_bx, ex_bp, ex_kind, ex_struct, ex_grade, "TRANSITION")
+                        array.set(piv_labs, prev_extreme_idx, new_lab)
+                        array.set(piv_leg_states, prev_extreme_idx, "TRANSITION")
+    out
+
+// Register a brand-new pivot (smallest grade)
 register_new_pivot(bx, bp, kind) =>
     struct = ""
     if kind == 1
@@ -107,7 +226,6 @@ register_new_pivot(bx, bp, kind) =>
     else
         struct := na(last_l_price) ? "?" : (bp < last_l_price ? "LL" : "HL")
         last_l_price := bp
-    // Update counters
     if struct == "HH"
         n_hh := n_hh + 1
     else if struct == "HL"
@@ -119,20 +237,21 @@ register_new_pivot(bx, bp, kind) =>
     else
         n_q := n_q + 1
     n_c := n_c + 1
-    // Push to arrays
     array.push(piv_bars, bx)
     array.push(piv_prices, bp)
     array.push(piv_kinds, kind)
     array.push(piv_grades, 1)
     array.push(piv_structs, struct)
-    lab = draw_label_for(bx, bp, kind, struct, 1)
+    new_idx = array.size(piv_bars) - 1
+    leg_state = process_leg(bp, kind, new_idx)
+    array.push(piv_leg_states, leg_state)
+    lab = draw_label_for(bx, bp, kind, struct, 1, leg_state)
     array.push(piv_labs, lab)
 
-// Find the most recent pivot of given (bar, kind) and upgrade its grade.
+// Find the most recent pivot of (bar, kind) and upgrade its grade
 upgrade_pivot(bx, kind, new_grade) =>
     n = array.size(piv_bars)
     if n > 0
-        // Search backward from most recent
         found = -1
         for i = n - 1 to 0 by -1
             if array.get(piv_bars, i) == bx
@@ -156,13 +275,11 @@ upgrade_pivot(bx, kind, new_grade) =>
                 label.delete(old_lab)
                 struct = array.get(piv_structs, found)
                 bp = array.get(piv_prices, found)
-                new_lab = draw_label_for(bx, bp, kind, struct, new_grade)
+                leg_state = array.get(piv_leg_states, found)
+                new_lab = draw_label_for(bx, bp, kind, struct, new_grade, leg_state)
                 array.set(piv_labs, found, new_lab)
 
 // === Process detections this bar ===========================================
-// Grade C fires first (smallest window), so it registers new pivots.
-// Then Grade B / Grade A may fire later for the same bar, upgrading.
-
 if not na(ph_c_val)
     register_new_pivot(bar_index - strength_c, ph_c_val, 1)
 if not na(pl_c_val)
@@ -179,21 +296,26 @@ if not na(pl_a_val)
     upgrade_pivot(bar_index - strength_a, -1, 3)
 
 // Status table ---------------------------------------------------------------
-var table tbl = table.new(position.top_right, 2, 9, bgcolor=color.new(color.gray, 80), border_width=1)
+var table tbl = table.new(position.top_right, 2, 10, bgcolor=color.new(color.gray, 80), border_width=1)
 if barstate.islast
-    table.cell(tbl, 0, 0, "Grade A", text_color=color.black, text_size=size.normal)
-    table.cell(tbl, 1, 0, str.tostring(n_a), text_color=color.black, text_size=size.normal)
-    table.cell(tbl, 0, 1, "Grade B", text_color=color.black, text_size=size.small)
-    table.cell(tbl, 1, 1, str.tostring(n_b), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 2, "Grade C", text_color=color.black, text_size=size.small)
-    table.cell(tbl, 1, 2, str.tostring(n_c), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 3, "HH", text_color=color.green, text_size=size.small)
-    table.cell(tbl, 1, 3, str.tostring(n_hh), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 4, "HL", text_color=color.green, text_size=size.small)
-    table.cell(tbl, 1, 4, str.tostring(n_hl), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 5, "LH", text_color=color.red,   text_size=size.small)
-    table.cell(tbl, 1, 5, str.tostring(n_lh), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 6, "LL", text_color=color.red,   text_size=size.small)
-    table.cell(tbl, 1, 6, str.tostring(n_ll), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 7, "?",  text_color=color.gray,  text_size=size.small)
-    table.cell(tbl, 1, 7, str.tostring(n_q),  text_color=color.black, text_size=size.small)
+    leg_dir_s = leg_dir == 0 ? "INIT" : leg_dir == 1 ? "UP" : "DOWN"
+    table.cell(tbl, 0, 0, "Leg dir", text_color=color.black, text_size=size.normal)
+    table.cell(tbl, 1, 0, leg_dir_s, text_color=color.black, text_size=size.normal)
+    table.cell(tbl, 0, 1, "Legs",    text_color=color.black, text_size=size.small)
+    table.cell(tbl, 1, 1, str.tostring(n_legs), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 2, "Grade A", text_color=color.black, text_size=size.small)
+    table.cell(tbl, 1, 2, str.tostring(n_a), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 3, "Grade B", text_color=color.black, text_size=size.small)
+    table.cell(tbl, 1, 3, str.tostring(n_b), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 4, "Grade C", text_color=color.black, text_size=size.small)
+    table.cell(tbl, 1, 4, str.tostring(n_c), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 5, "HH", text_color=color.green, text_size=size.small)
+    table.cell(tbl, 1, 5, str.tostring(n_hh), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 6, "HL", text_color=color.green, text_size=size.small)
+    table.cell(tbl, 1, 6, str.tostring(n_hl), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 7, "LH", text_color=color.red,   text_size=size.small)
+    table.cell(tbl, 1, 7, str.tostring(n_lh), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 8, "LL", text_color=color.red,   text_size=size.small)
+    table.cell(tbl, 1, 8, str.tostring(n_ll), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 9, "?",  text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 9, str.tostring(n_q),  text_color=color.black, text_size=size.small)
