@@ -373,7 +373,7 @@ def _band_robust(slope, pivs: List[Piv], direction, top_pct):
 
 
 def _emit_robust(segs, seg_chain, leg_pivs, direction, top_pct, c, n,
-                 atr_v=None, margin_atr=0.25, min_move_atr=0.0):
+                 atr_v=None, margin_atr=0.25, min_move_atr=0.0, min_grade=1):
     """Robust band + extend the channel to the right until a bar CLOSES beyond
     the trend-side line by a CLEAN-break margin (UP: close < support - margin /
     DOWN: close > resistance + margin). The margin stops normal bounces from
@@ -396,7 +396,22 @@ def _emit_robust(segs, seg_chain, leg_pivs, direction, top_pct, c, n,
         if net_move < min_move_atr * atr_v[x1]:
             return
     inside = [p for p in leg_pivs if x0 <= p.idx <= x1] or seg_chain
-    sup_b, res_b = _band_robust(m, inside, direction, top_pct)
+    tol = (atr_v[x1] * 0.4) if atr_v is not None else 0.0
+    lo_all = [p.price - m * p.idx for p in inside if p.kind == -1] or [p.price - m * p.idx for p in inside]
+    hi_all = [p.price - m * p.idx for p in inside if p.kind == 1] or [p.price - m * p.idx for p in inside]
+    lo_maj = [p.price - m * p.idx for p in inside if p.kind == -1 and p.grade >= min_grade] or lo_all
+    hi_maj = [p.price - m * p.idx for p in inside if p.kind == 1 and p.grade >= min_grade] or hi_all
+    # Trend-side rail = exact extreme over ALL-grade pivots, so it rides the LOWEST
+    # low / HIGHEST high -- lower-grade pivots that sit below the major lows still
+    # get touched and don't trigger a false breach (Mouli: "adjust to pivots
+    # below, extend until lower line is breached"). Opposite rail = max-touch over
+    # MAJOR pivots, <=2 anomalies.
+    if direction == 1:
+        sup_b = min(lo_all)
+        res_b = _best_offset(hi_maj, tol, 2)
+    else:
+        res_b = max(hi_all)
+        sup_b = -_best_offset([-r for r in lo_maj], tol, 2)
     x1e = n - 1
     for b in range(x1 + 1, n):
         mgn = (atr_v[b] * margin_atr) if atr_v is not None else 0.0
@@ -430,14 +445,14 @@ def method_piecewise_robust(legs, pivs, h, l, c, min_grade, atr_v,
             maxres = 0.0 if m is None else max(abs(y - (m * x + b))
                                                for x, y in zip(xs, ys))
             if m is not None and maxres > tol and (i - 1) - seg_start >= 2:
-                _emit_robust(segs, cp[seg_start:i - 1], lp, lg.direction,
-                             top_pct, c, n, atr_v, margin_atr, min_move_atr)
+                _emit_robust(segs, cp[seg_start:i - 1], pivs, lg.direction,
+                             top_pct, c, n, atr_v, margin_atr, min_move_atr, min_grade)
                 seg_start = i - 2
                 i = seg_start + 2
             else:
                 i += 1
-        _emit_robust(segs, cp[seg_start:], lp, lg.direction, top_pct, c, n,
-                     atr_v, margin_atr, min_move_atr)
+        _emit_robust(segs, cp[seg_start:], pivs, lg.direction, top_pct, c, n,
+                     atr_v, margin_atr, min_move_atr, min_grade)
     # Clean handoff: a channel stops where the next one starts (or earlier, at
     # its own support break). Prevents many channels all running to session end.
     segs.sort(key=lambda s: s.x0)
@@ -516,6 +531,122 @@ def method_lower_upper(legs, pivs, h, l, c, min_grade, atr_v,
         if segs[i + 1].x0 > segs[i].x0:
             segs[i].x1 = min(segs[i].x1, segs[i + 1].x0)
     return segs
+
+
+def _hull_slope(chain, direction):
+    """Slope of the line through the anchor that no chain pivot crosses: MIN
+    slope to a later pivot for UP (line stays under the lows), MAX for DOWN."""
+    a = chain[0]
+    slope = None
+    for p in chain[1:]:
+        if p.idx == a.idx:
+            continue
+        s = (p.price - a.price) / (p.idx - a.idx)
+        if slope is None:
+            slope = s
+        elif direction == 1:
+            slope = min(slope, s)
+        else:
+            slope = max(slope, s)
+    return slope
+
+
+def _best_offset(res_list, tol, max_outside):
+    """Pick the parallel-line intercept that maximizes pivot TOUCHES (within tol)
+    while letting at most max_outside pivots poke beyond it (anomalies)."""
+    best, best_ct = None, -1
+    for cand in res_list:
+        outside = sum(1 for r in res_list if r > cand + 1e-9)
+        if outside > max_outside:
+            continue
+        ct = sum(1 for r in res_list if abs(r - cand) <= tol)
+        if ct > best_ct:
+            best_ct, best = ct, cand
+    return best if best is not None else max(res_list)
+
+
+def _emit_hull(segs, seg_chain, leg_pivs, direction, c, n, atr_v,
+               margin_atr=0.25, min_move_atr=2.5, touch_atr=0.4, max_anom=2):
+    """Hull slope (touches 2+ trend-side pivots, none overshoot that side).
+    Opposite rail = parallel offset chosen to MAXIMIZE touches with <= max_anom
+    pivots poking out. Returns (seg, lo_touches, hi_touches) via segs append +
+    a parallel touch tally is computed by the caller if needed."""
+    if len(seg_chain) < 2:
+        return
+    m = _hull_slope(seg_chain, direction)
+    if m is None:
+        return
+    x0 = seg_chain[0].idx
+    x1p = seg_chain[-1].idx
+    if min_move_atr > 0 and atr_v is not None and abs(m * (x1p - x0)) < min_move_atr * atr_v[x1p]:
+        return
+    lows = [p for p in leg_pivs if x0 <= p.idx <= x1p and p.kind == -1]
+    highs = [p for p in leg_pivs if x0 <= p.idx <= x1p and p.kind == 1]
+    tol = (atr_v[x1p] * touch_atr) if atr_v is not None else 0.0
+    lo_res = [p.price - m * p.idx for p in lows] or [p.price - m * p.idx for p in seg_chain]
+    hi_res = [p.price - m * p.idx for p in highs] or [p.price - m * p.idx for p in seg_chain]
+    if direction == 1:
+        sup_b = min(lo_res)                                  # hull: touches lows
+        res_b = _best_offset(hi_res, tol, max_anom)          # max-touch upper
+    else:
+        res_b = max(hi_res)                                  # hull: touches highs
+        sup_b = -_best_offset([-r for r in lo_res], tol, max_anom)
+    x1e = n - 1
+    for b in range(x1p + 1, n):
+        mgn = (atr_v[b] * margin_atr) if atr_v is not None else 0.0
+        if direction == 1 and c[b] < m * b + sup_b - mgn:
+            x1e = b; break
+        if direction == 2 and c[b] > m * b + res_b + mgn:
+            x1e = b; break
+    segs.append(ChannelSeg(x0, x1e, m, sup_b, res_b, direction))
+
+
+def method_hull(legs, pivs, h, l, c, min_grade, atr_v, tol_atr=1.2,
+                margin_atr=0.25, min_move_atr=2.5, touch_atr=0.4) -> List[ChannelSeg]:
+    """Parallel channel with a HULL slope (rails touch pivots instead of an
+    averaged regression that pivots overshoot)."""
+    n = len(h)
+    segs = []
+    for lg in legs:
+        chain_kind = -1 if lg.direction == 1 else 1
+        lp = [pivs[i] for i in lg.piv_idxs]
+        cp = [p for p in lp if p.kind == chain_kind]
+        if len(cp) < 2:
+            continue
+        seg_start = 0
+        i = 2
+        while i <= len(cp):
+            xs = [p.idx for p in cp[seg_start:i]]
+            ys = [p.price for p in cp[seg_start:i]]
+            mm, bb = _regress(xs, ys)
+            tol = atr_v[cp[i - 1].idx] * tol_atr if atr_v is not None else 1e9
+            maxres = 0.0 if mm is None else max(abs(y - (mm * x + bb)) for x, y in zip(xs, ys))
+            if mm is not None and maxres > tol and (i - 1) - seg_start >= 2:
+                _emit_hull(segs, cp[seg_start:i - 1], lp, lg.direction, c, n, atr_v, margin_atr, min_move_atr, touch_atr)
+                seg_start = i - 2
+                i = seg_start + 2
+            else:
+                i += 1
+        _emit_hull(segs, cp[seg_start:], lp, lg.direction, c, n, atr_v, margin_atr, min_move_atr, touch_atr)
+    segs.sort(key=lambda s: s.x0)
+    for i in range(len(segs) - 1):
+        if segs[i + 1].x0 > segs[i].x0:
+            segs[i].x1 = min(segs[i].x1, segs[i + 1].x0)
+    return segs
+
+
+def count_touches(segs, pivs, atr_v, touch_atr=0.4):
+    """Per channel: how many lows touch the lower rail and highs the upper rail."""
+    out = []
+    for s in segs:
+        us = s.hi_slope if s.hi_slope is not None else s.slope
+        tol = atr_v[min(s.x1, len(atr_v) - 1)] * touch_atr
+        lo_t = sum(1 for p in pivs if p.kind == -1 and s.x0 <= p.idx <= s.x1
+                   and abs(p.price - (s.slope * p.idx + s.sup_b)) <= tol)
+        hi_t = sum(1 for p in pivs if p.kind == 1 and s.x0 <= p.idx <= s.x1
+                   and abs(p.price - (us * p.idx + s.res_b)) <= tol)
+        out.append((lo_t, hi_t))
+    return out
 
 
 def method_piecewise_regression(legs, pivs, h, l, min_grade,
@@ -717,13 +848,19 @@ def main():
          method_spike_and_channel(legs, pivs, h, l, 3, atr_v, 0.75)),
         ("F_piecewise_regression tol1.2 (spike->grind split)",
          method_piecewise_regression(legs, pivs, h, l, 3, atr_v, 1.2)),
-        ("J_parallel + trend-filter 2.5ATR",
+        ("J_fit1.2 (splits grind)",
          method_piecewise_robust(legs, pivs, h, l, c, 3, atr_v, 1.2, 85, 0.25, 2.5)),
-        ("L_lower-from-lows_upper-from-highs (wedge) +filter2.5",
-         method_lower_upper(legs, pivs, h, l, c, 3, atr_v, 1.2, 0.25, 2.5)),
-        ("M_lower-upper no filter",
-         method_lower_upper(legs, pivs, h, l, c, 3, atr_v, 1.2, 0.25, 0.0)),
+        ("P_fit2.5 (grind stays one channel)",
+         method_piecewise_robust(legs, pivs, h, l, c, 3, atr_v, 2.5, 85, 0.25, 2.5)),
+        ("Q_fit3.5 (loosest)",
+         method_piecewise_robust(legs, pivs, h, l, c, 3, atr_v, 3.5, 85, 0.25, 2.5)),
     ]
+    # touch-count diagnostic: lower/upper pivot touches per channel
+    for label, segs in methods:
+        tc = count_touches(segs, pivs, atr_v, 0.4)
+        avg_lo = sum(t[0] for t in tc) / len(tc) if tc else 0
+        avg_hi = sum(t[1] for t in tc) / len(tc) if tc else 0
+        print(f"  TOUCHES {label[:24]:24s}: lower avg {avg_lo:.1f}, upper avg {avg_hi:.1f}  per-ch {tc}")
 
     for label, segs in methods:
         safe = label.split(" ")[0]

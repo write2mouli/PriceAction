@@ -52,8 +52,9 @@ major_min_grade = input.int(3, "Major: min pivot grade for channel touches (3=A,
 major_break_atr = input.float(2.0, "Major: break threshold (xATR)", minval=0.25, maxval=8.0, step=0.25, tooltip="Higher = fewer, broader major legs. A major leg only reverses when a Grade-A pivot breaks its HL/LH chain by this many ATRs. Raise it if the trend keeps flipping UP/DOWN on pullbacks (opposite-color channels crossing).", group="Major channels")
 major_keep = input.int(24, "Major: keep only the last N channels", minval=1, maxval=200, tooltip="Caps how many finalized major channels stay on the chart, so they don't pile up infinitely across all loaded history. With ~6-8 clean channels per day, 24 keeps roughly the last 3 trading days. Raise it to see more history; lower it to declutter when zoomed in.", group="Major channels")
 major_min_move_atr = input.float(2.5, "Major: min trend move to draw a channel (xATR)", minval=0.0, maxval=15.0, step=0.5, tooltip="Trend-quality filter. A segment only draws a channel once its net directional travel (|slope x span|) reaches this many ATRs. Chop goes nowhere, so it stays blank -- the channel emerges progressively as a real trend develops. Raise it to suppress more chop / only show strong trends; 0 disables the filter.", group="Major channels")
+major_touch_atr = input.float(0.4, "Major: pivot touch tolerance (xATR)", minval=0.05, maxval=2.0, step=0.05, tooltip="How close a pivot must sit to a rail to count as a TOUCH. The trend-side rail is the exact extreme (touches the lowest low / highest high); the opposite rail's offset is chosen to land on the MOST pivots within this tolerance while letting at most 2 poke out as anomalies.", group="Major channels")
 major_width = input.int(3, "Major: line width (px)", minval=1, maxval=6, group="Major channels")
-major_fit_atr = input.float(1.2, "Major: regression fit tolerance (xATR)", minval=0.25, maxval=5.0, step=0.1, tooltip="Piecewise regression (spike-and-channel). The major channel slope is the least-squares regression over the segment's support pivots, recomputed each pivot so it DEVELOPS as time progresses. When a new pivot makes that regression stop fitting -- max residual of the support pivots exceeds this many ATRs -- the segment is finalized and a fresh regression starts at the prior pivot (a genuine slope change like spike->grind). Larger = fewer, longer channels.", group="Major channels")
+major_fit_atr = input.float(2.5, "Major: regression fit tolerance (xATR)", minval=0.25, maxval=8.0, step=0.1, tooltip="Piecewise regression (spike-and-channel). A segment splits only when its support-pivot regression stops fitting by this many ATRs -- so a BIG slope change (spike->grind) splits, but the grind's minor wiggles do NOT, keeping a trend as ONE long channel. Lower it to split more readily; raise it for fewer, longer channels.", group="Major channels")
 major_break_margin_atr = input.float(0.25, "Major: clean-break margin (xATR)", minval=0.0, maxval=2.0, step=0.05, tooltip="A channel ends only when a bar CLOSES beyond its trend-side line (support for UP / resistance for DOWN) by at least this many ATRs -- a CLEAN break, not a marginal poke. Raise it if downtrends fragment into many short channels because normal bounces nick the resistance.", group="Major channels")
 
 // EMA + ATR ------------------------------------------------------------------
@@ -610,6 +611,35 @@ retag_label(idx, new_leg_state) =>
             array.set(piv_labs, idx, new_lab)
             array.set(piv_leg_states, idx, new_leg_state)
 
+// Max-touch offset for the OPPOSITE rail. Among the want_kind pivots' residuals
+// (price - slope*bar) in [seg_start_idx, end], pick the intercept that lands on
+// the MOST pivots within `tol`, while at most `max_anom` pivots poke past it
+// (above when count_above, else below). The trend-side rail stays the exact
+// extreme; this maximizes touches on the other rail (Mouli: ">=2 touches, 2
+// anomalies ok, more touches better"). Returns the chosen intercept (na if none).
+best_offset_for(seg_start_idx, slope, min_grade, want_kind, tol, max_anom, count_above) =>
+    n = array.size(piv_bars)
+    float best = na
+    int   best_ct = -1
+    if seg_start_idx >= 0
+        for ci = seg_start_idx to n - 1
+            if array.get(piv_kinds, ci) == want_kind and array.get(piv_grades, ci) >= min_grade
+                cand = array.get(piv_prices, ci) - slope * array.get(piv_bars, ci)
+                int outside = 0
+                int touch = 0
+                for cj = seg_start_idx to n - 1
+                    if array.get(piv_kinds, cj) == want_kind and array.get(piv_grades, cj) >= min_grade
+                        r = array.get(piv_prices, cj) - slope * array.get(piv_bars, cj)
+                        if math.abs(r - cand) <= tol
+                            touch := touch + 1
+                        pokes = count_above ? (r - cand > tol) : (cand - r > tol)
+                        if pokes
+                            outside := outside + 1
+                if outside <= max_anom and touch > best_ct
+                    best_ct := touch
+                    best := cand
+    best
+
 // Adaptive 3-line channel update for the CURRENT leg. Called after every new
 // pivot in an active leg. Pure compute -- doesn't mutate globals; caller
 // re-assigns the returned line refs.
@@ -694,39 +724,31 @@ update_current_channel(leg_direction, leg_start_idx, cur_chain, cur_par, cur_cen
                 // slope, the min residual equals the anchor AND binding-pivot
                 // residual, so the trend-side edge passes through 2+ pivots
                 // (clean touches); the opposite edge rides the extreme excursion.
-                // Track the top-2 and bottom-2 residuals so the MAJOR layer can
-                // drop a single overshoot on the non-trend side (an 'overshoot
-                // anomaly' should poke OUT, not widen the channel) -- the
-                // trend-side edge stays exact so support still touches the lows.
+                // Trend-side rail = exact extreme over ALL-grade pivots, so it rides
+                // the LOWEST low / HIGHEST high. Lower-grade swing pivots that sit
+                // below the major lows then still get touched and don't trigger a
+                // false breach -- the channel extends until price genuinely closes
+                // through the rail. (Slope is still from the major chain; only the
+                // rail OFFSET broadens to all grades.) Opposite rail (major only) =
+                // the MAX-TOUCH offset: lands on the most major pivots with <=2
+                // anomalies poking out.
                 float rmax1 = -1.0e18
-                float rmax2 = -1.0e18
                 float rmin1 =  1.0e18
-                float rmin2 =  1.0e18
-                int   nenv  = 0
                 for i = leg_start_idx to n - 1
-                    if array.get(piv_grades, i) >= min_grade
-                        rb = array.get(piv_bars, i)
-                        rp = array.get(piv_prices, i)
-                        resid = rp - slope * rb
-                        nenv := nenv + 1
-                        if resid > rmax1
-                            rmax2 := rmax1
-                            rmax1 := resid
-                        else if resid > rmax2
-                            rmax2 := resid
-                        if resid < rmin1
-                            rmin2 := rmin1
-                            rmin1 := resid
-                        else if resid < rmin2
-                            rmin2 := resid
-                trim = maj and nenv >= 4
-                float r_max = (trim and rmax2 > -1.0e17) ? rmax2 : rmax1
-                float r_min = (trim and rmin2 <  1.0e17) ? rmin2 : rmin1
-                // Keep the trend-defining edge exact (touch the lows/highs).
-                if maj and leg_direction == 1
-                    r_min := rmin1
-                if maj and leg_direction == 2
-                    r_max := rmax1
+                    if array.get(piv_grades, i) >= 1
+                        resid = array.get(piv_prices, i) - slope * array.get(piv_bars, i)
+                        rmax1 := math.max(rmax1, resid)
+                        rmin1 := math.min(rmin1, resid)
+                float r_max = rmax1
+                float r_min = rmin1
+                if maj
+                    tol_t = major_touch_atr * (na(atr14) ? 0.0 : atr14)
+                    if leg_direction == 1
+                        bo = best_offset_for(leg_start_idx, slope, min_grade, 1, tol_t, 2, true)
+                        r_max := na(bo) ? rmax1 : bo          // upper: max-touch, <=2 above
+                    else
+                        bo = best_offset_for(leg_start_idx, slope, min_grade, -1, tol_t, 2, false)
+                        r_min := na(bo) ? rmin1 : bo          // support: max-touch, <=2 below
                 left_x  = array.get(piv_bars, leg_start_idx)
                 right_x = bar_index
                 up_yL = slope * left_x  + r_max
