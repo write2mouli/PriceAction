@@ -232,6 +232,9 @@ class ChannelSeg:
     res_b: float          # upper-line intercept (resistance for UP)
     direction: int
     hi_slope: float = None  # upper-line slope; None -> parallel (use `slope`)
+    breach_x: int = None    # bar of the CONFIRMED change-of-character (CHoCH)
+    breach_y: float = None
+    temps: list = None      # [(bar, price)] temp breaches / anomalies (tolerated)
 
 
 def _regress(xs, ys):
@@ -652,6 +655,107 @@ def count_touches(segs, pivs, atr_v, touch_atr=0.4):
     return out
 
 
+def method_hl_chain(legs, pivs, h, l, c, min_grade, atr_v,
+                    fit_atr=2.5, min_move_atr=2.5, breach_atr=1.5) -> List[ChannelSeg]:
+    """Dow support model with ANOMALY-vs-CHoCH detection (uptrend; mirror down):
+      - Support = line through the rising lows (HLs); re-fits as higher lows form.
+      - SLOPE-CHANGE split: when a new HL makes the segment's regression stop
+        fitting (max residual > fit_atr*ATR) -- the slope steepened OR flattened
+        (spike -> flat grind) -- close the support and start a fresh one from the
+        prior HL with the new slope. (A piecewise support, like a hand drawing.)
+      - A weak dip (within breach_atr*ATR of the last low) = anomaly, tolerated.
+      - A HARD lower low is PENDING; it's a CHANGE OF CHARACTER only if the next
+        high is a LOWER high (trend failed to resume). If a HIGHER high follows,
+        the break was a temp breach / liquidity grab = anomaly.
+      - CHoCH ends the channel (X). Anomalies = small dots, channel continues."""
+    n = len(h)
+    segs = []
+    for lg in legs:
+        up = lg.direction == 1
+        ck = -1 if up else 1
+        lp = [pivs[i] for i in lg.piv_idxs]
+        if sum(1 for p in lp if p.kind == ck) < 2:
+            continue
+
+        def emit(chain_seg, choch, temps):
+            if len(chain_seg) < 2:
+                return
+            m, b_reg = _regress([p.idx for p in chain_seg], [p.price for p in chain_seg])
+            if m is None:
+                return
+            x0 = chain_seg[0].idx
+            x1p = chain_seg[-1].idx
+            if min_move_atr > 0 and abs(m * (x1p - x0)) < min_move_atr * atr_v[x1p]:
+                return
+            end_idx = choch.idx if choch else (n - 1)
+            span = [p for p in lp if x0 <= p.idx <= end_idx]
+            tol = atr_v[x1p] * 0.4
+            # Trend-side rail = the regression line THROUGH the chain pivots (the
+            # rising lows for UP). Best fit => hugs the swing pivots with the least
+            # white space ("optimized for pivots"), instead of being offset down to
+            # the single lowest wick. Opposite rail = max-touch over span pivots.
+            if up:
+                sb = b_reg
+                hr = [p.price - m * p.idx for p in span if p.kind == 1] or [sb]
+                lo_b, up_b = sb, _best_offset(hr, tol, 2)
+            else:
+                sb = b_reg
+                lr = [p.price - m * p.idx for p in span if p.kind == -1] or [sb]
+                lo_b, up_b = -_best_offset([-r for r in lr], tol, 2), sb
+            so = ChannelSeg(x0, end_idx, m, lo_b, up_b, lg.direction)
+            if choch:
+                so.breach_x, so.breach_y = choch.idx, choch.price
+            so.temps = list(temps)
+            segs.append(so)
+
+        chain_seg, last_chain, last_opp, pend, temps = [], None, None, None, []
+        for p in lp:
+            thr = atr_v[p.idx] * breach_atr
+            if p.kind == ck:                                   # trend-side pivot (low for UP)
+                if last_chain is None:
+                    chain_seg, last_chain = [p], p
+                    continue
+                higher = (p.price > last_chain.price) if up else (p.price < last_chain.price)
+                if higher:                                      # higher low -> extends support
+                    # Fit-break: if adding this HL makes the segment regression
+                    # stop fitting, the slope changed (steepened OR flattened, e.g.
+                    # spike -> flat grind) -> close this support, start a fresh one
+                    # from the prior HL with the new slope.
+                    test = chain_seg + [p]
+                    mt, bt = _regress([q.idx for q in test], [q.price for q in test])
+                    mr = max(abs(q.price - (mt * q.idx + bt)) for q in test) if mt is not None else 0.0
+                    if len(chain_seg) >= 2 and mt is not None and mr > atr_v[p.idx] * fit_atr:
+                        emit(chain_seg, None, temps)
+                        chain_seg, temps = [last_chain, p], []
+                    else:
+                        chain_seg.append(p)
+                    last_chain = p
+                else:                                           # lower low
+                    beyond = (p.price < last_chain.price - thr) if up else (p.price > last_chain.price + thr)
+                    if beyond:
+                        pend = p                                # pending CHoCH (awaits a high)
+                    else:
+                        temps.append(p)                         # weak dip = anomaly
+                    last_chain = p
+            else:                                               # opposite pivot (high for UP)
+                if pend is not None and last_opp is not None:
+                    lower_high = (p.price < last_opp.price) if up else (p.price > last_opp.price)
+                    if lower_high:                              # CHoCH confirmed
+                        emit(chain_seg, pend, temps)
+                        chain_seg, temps, last_chain = [pend], [], pend
+                        pend = None
+                    else:                                       # higher high -> temp breach
+                        temps.append(pend)
+                        pend = None
+                last_opp = p
+        emit(chain_seg, None, temps)
+    segs.sort(key=lambda s: s.x0)
+    for i in range(len(segs) - 1):
+        if segs[i + 1].x0 > segs[i].x0:
+            segs[i].x1 = min(segs[i].x1, segs[i + 1].x0)
+    return segs
+
+
 def method_piecewise_regression(legs, pivs, h, l, min_grade,
                                 atr_v, tol_atr=1.2) -> List[ChannelSeg]:
     """Develops regressively: within a leg, greedily extend a regression line
@@ -757,6 +861,13 @@ def _draw_segs(ax, segs: List[ChannelSeg]):
         ax.plot([s.x0, s.x1], [yhi0, yhi1], color=col, linewidth=1.6, zorder=4)
         ax.plot([s.x0, s.x1], [(ylo0 + yhi0) / 2.0, (ylo1 + yhi1) / 2.0],
                 color=col, linewidth=0.7, linestyle=":", zorder=4)
+        if s.breach_x is not None:
+            ax.scatter(s.breach_x, s.breach_y, s=110, marker="x",
+                       color="magenta", zorder=6, linewidths=2.5)
+        if s.temps:
+            for tx, ty in [(p.idx, p.price) for p in s.temps]:
+                ax.scatter(tx, ty, s=22, marker="o", facecolors="none",
+                           edgecolors="gray", zorder=6, linewidths=1)
 
 
 def render_grid(ts, o, h, l, c, pivs, results, out_path):
@@ -839,22 +950,14 @@ def main():
               f"bars[{pivs[lg.start_piv].idx}..{pivs[lg.end_piv].idx}]")
 
     methods = [
-        ("A_regression_per_leg (slope=reg over lows)",
-         method_regression_per_leg(legs, pivs, h, l, 3)),
-        ("B_regression_centered (slope=reg over all)",
-         method_regression_centered(legs, pivs, h, l, 3)),
-        ("C_rolling_regression (win45, no legs)",
-         method_rolling_regression(legs, pivs, h, l, 3, win_bars=45, step=6)),
-        ("D_hull_support (touches lows)",
-         method_hull_support(legs, pivs, h, l, 3)),
-        ("E_spike_and_channel (current Pine)",
-         method_spike_and_channel(legs, pivs, h, l, 3, atr_v, 0.75)),
-        ("F_piecewise_regression tol1.2 (spike->grind split)",
-         method_piecewise_regression(legs, pivs, h, l, 3, atr_v, 1.2)),
-        ("P_fit2.5 exact support (current)",
-         method_piecewise_robust(legs, pivs, h, l, c, 3, atr_v, 2.5, 85, 0.25, 2.5, 0)),
-        ("R_fit2.5 support rides cluster (<=2 undershoot)",
-         method_piecewise_robust(legs, pivs, h, l, c, 3, atr_v, 2.5, 85, 0.25, 2.5, 2)),
+        ("W1_fit1.5_breach1.5 (splits spike from flat grind)",
+         method_hl_chain(legs, pivs, h, l, c, 3, atr_v, 1.5, 2.5, 1.5)),
+        ("W2_fit2.0_breach1.5",
+         method_hl_chain(legs, pivs, h, l, c, 3, atr_v, 2.0, 2.5, 1.5)),
+        ("W3_fit2.5_breach1.5",
+         method_hl_chain(legs, pivs, h, l, c, 3, atr_v, 2.5, 2.5, 1.5)),
+        ("W4_fit3.5_breach1.5 (longer single supports)",
+         method_hl_chain(legs, pivs, h, l, c, 3, atr_v, 3.5, 2.5, 1.5)),
     ]
     # touch-count diagnostic: lower/upper pivot touches per channel
     for label, segs in methods:
