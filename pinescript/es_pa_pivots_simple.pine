@@ -35,7 +35,7 @@ show_ema     = input.bool(true,  "Show EMA21", group="Display")
 leg_break_atr = input.float(0.75, "Leg break threshold (xATR)", minval=0.0, maxval=3.0, step=0.05, tooltip="Raised from 0.5: minor wiggles inside a range no longer spawn micro-legs.", group="Legs")
 use_leg_color = input.bool(true, "Color pivots by leg state (instead of HH/HL/LH/LL)", group="Legs")
 
-show_channels  = input.bool(true, "Draw parallel channel per leg", group="Channels")
+show_channels  = input.bool(false, "Draw MINOR parallel channel per leg (green/red)", group="Channels")
 channel_min_pivots = input.int(2, "Min HL/LH pivots to start drawing", minval=2, maxval=10, tooltip="Need at least this many HLs (UP) or LHs (DOWN) before the channel appears. 2 = draw as soon as the slope can be defined.", group="Channels")
 channel_extend = input.bool(true, "Extend channel lines to the right", group="Channels")
 channel_touch_atr = input.float(0.4, "Touch tolerance (xATR)", minval=0.05, maxval=2.0, step=0.05, tooltip="A pivot counts as a touch of the parallel if it's within this distance of the line. Used for the solid-channel test.", group="Channels")
@@ -49,7 +49,8 @@ broad_min_run = input.int(3, "Range merge: consecutive small legs to merge", min
 // minor green/red ones -- the steep impulse and the broad grind each as ONE.
 show_major = input.bool(true, "Draw major-scale channels (cyan)", group="Major channels")
 major_min_grade = input.int(3, "Major: min pivot grade for channel touches (3=A, 2=B+)", minval=2, maxval=3, tooltip="Leg structure is always defined by Grade-A swings; this controls which pivots the channel regression rides. 3 (A only) matches the validated Python prototype -- cleaner. 2 (B+) adds more touch points if the channels look too sparse.", group="Major channels")
-major_break_atr = input.float(1.5, "Major: break threshold (xATR)", minval=0.25, maxval=5.0, step=0.25, tooltip="Higher = fewer, broader major legs. A major leg only reverses when a Grade-A pivot breaks its HL/LH chain by this many ATRs. Raise it if the midday grind splits into several channels instead of one.", group="Major channels")
+major_break_atr = input.float(2.0, "Major: break threshold (xATR)", minval=0.25, maxval=8.0, step=0.25, tooltip="Higher = fewer, broader major legs. A major leg only reverses when a Grade-A pivot breaks its HL/LH chain by this many ATRs. Raise it if the trend keeps flipping UP/DOWN on pullbacks (opposite-color channels crossing).", group="Major channels")
+major_keep = input.int(24, "Major: keep only the last N channels", minval=1, maxval=200, tooltip="Caps how many finalized major channels stay on the chart, so they don't pile up infinitely across all loaded history. With ~6-8 clean channels per day, 24 keeps roughly the last 3 trading days. Raise it to see more history; lower it to declutter when zoomed in.", group="Major channels")
 major_width = input.int(3, "Major: line width (px)", minval=1, maxval=6, group="Major channels")
 major_fit_atr = input.float(1.2, "Major: regression fit tolerance (xATR)", minval=0.25, maxval=5.0, step=0.1, tooltip="Piecewise regression (spike-and-channel). The major channel slope is the least-squares regression over the segment's support pivots, recomputed each pivot so it DEVELOPS as time progresses. When a new pivot makes that regression stop fitting -- max residual of the support pivots exceeds this many ATRs -- the segment is finalized and a fresh regression starts at the prior pivot (a genuine slope change like spike->grind). Larger = fewer, longer channels.", group="Major channels")
 major_break_margin_atr = input.float(0.25, "Major: clean-break margin (xATR)", minval=0.0, maxval=2.0, step=0.05, tooltip="A channel ends only when a bar CLOSES beyond its trend-side line (support for UP / resistance for DOWN) by at least this many ATRs -- a CLEAN break, not a marginal poke. Raise it if downtrends fragment into many short channels because normal bounces nick the resistance.", group="Major channels")
@@ -128,6 +129,12 @@ var float m_el_price  = na
 var line  m_chain = na
 var line  m_par   = na
 var line  m_cen   = na
+// Bounded registry of FINALIZED major channels (keep only the last major_keep).
+// The script runs over all loaded history, so without a cap channels from every
+// prior day accumulate into an overlap mess.
+var array<line> mfin_chain = array.new<line>(0)
+var array<line> mfin_par   = array.new<line>(0)
+var array<line> mfin_cen   = array.new<line>(0)
 // Piecewise regression: the current channel SEGMENT (one regression phase within
 // the leg). Its slope is the regression over the segment's support pivots,
 // recomputed each pivot. When that regression stops fitting, the segment is
@@ -388,6 +395,23 @@ finalize_channel(ln, clip_x) =>
             sl = (y2 - y1) / (x2 - x1)
             line.set_xy2(ln, clip_x, y1 + sl * (clip_x - x1))
         line.set_extend(ln, extend.none)
+
+// Finalize a major channel (clip its 3 lines to clip_x) AND register it in the
+// bounded keep-last-N buffer. When the buffer overflows, delete the OLDEST
+// channel's 3 lines so historical channels don't pile up across days.
+// (array.push/shift/delete are allowed inside functions -- in-place mutation.)
+register_major(ch, par, cen, clip_x) =>
+    if not na(ch)
+        finalize_channel(ch, clip_x)
+        finalize_channel(par, clip_x)
+        finalize_channel(cen, clip_x)
+        array.push(mfin_chain, ch)
+        array.push(mfin_par, par)
+        array.push(mfin_cen, cen)
+        if array.size(mfin_chain) > major_keep
+            line.delete(array.shift(mfin_chain))
+            line.delete(array.shift(mfin_par))
+            line.delete(array.shift(mfin_cen))
 
 // Registry of finalized (completed) channels, used to dedup overlaps. We keep
 // the three line refs plus each channel's bar range [xa, xb].
@@ -781,6 +805,24 @@ major_prev_chain(seg_start_idx, min_grade, chain_kind, before_idx) =>
 // === Process detections this bar ===========================================
 thr = na(atr14) ? 0.0 : atr14 * leg_break_atr
 
+// New trading day: major channels are scoped PER DAY (the chart is read day by
+// day), so finalize the day's live channel and reset the major machine fresh.
+// Prior days' channels stay on the chart -- the major_keep cap only guards
+// against unbounded growth over very long history, it is NOT the consolidator.
+if timeframe.change("1D")
+    register_major(m_chain, m_par, m_cen, bar_index)
+    m_chain := na
+    m_par   := na
+    m_cen   := na
+    m_seg_start_idx := -1
+    m_leg_dir   := 0
+    m_last_hl   := na
+    m_last_lh   := na
+    m_eh_idx    := -1
+    m_el_idx    := -1
+    m_eh_price  := na
+    m_el_price  := na
+
 // --- Grade C HIGH ---
 if not na(ph_c_val)
     bx = bar_index - strength_c
@@ -1001,9 +1043,7 @@ if not na(ph_a_val)
         if m_retro >= 0
             // Major CHoCH reversal: finalize the live segment, start a fresh
             // leg + segment anchored at the CHoCH pivot (prior leg extreme).
-            finalize_channel(m_chain, bar_index)
-            finalize_channel(m_par, bar_index)
-            finalize_channel(m_cen, bar_index)
+            register_major(m_chain, m_par, m_cen, bar_index)
             m_chain := na
             m_par   := na
             m_cen   := na
@@ -1022,9 +1062,15 @@ if not na(ph_a_val)
             [fm, fb, fcnt, fmax] = major_reg_fit(m_seg_start_idx, major_min_grade, 1)
             if fcnt >= 3 and fmax > major_fit_atr * (na(atr14) ? 0.0 : atr14)
                 pc = major_prev_chain(m_seg_start_idx, major_min_grade, 1, found_idx)
-                finalize_channel(m_chain, bar_index)
-                finalize_channel(m_par, bar_index)
-                finalize_channel(m_cen, bar_index)
+                // Clean handoff: clip the old channel where the NEW one starts
+                // (the prior chain pivot), not at the current bar -- otherwise
+                // they overlap by [pc .. now] and the chart turns to mush.
+                // (if-guard, not ternary: Pine eagerly evaluates both branches
+                // so array.get with pc=-1 would trap.)
+                int hb = bar_index
+                if pc >= 0
+                    hb := array.get(piv_bars, pc)
+                register_major(m_chain, m_par, m_cen, hb)
                 m_chain := na
                 m_par   := na
                 m_cen   := na
@@ -1071,9 +1117,7 @@ if not na(pl_a_val)
         m_eh_price := m_nehp
         m_el_price := m_nelp
         if m_retro >= 0
-            finalize_channel(m_chain, bar_index)
-            finalize_channel(m_par, bar_index)
-            finalize_channel(m_cen, bar_index)
+            register_major(m_chain, m_par, m_cen, bar_index)
             m_chain := na
             m_par   := na
             m_cen   := na
@@ -1089,9 +1133,11 @@ if not na(pl_a_val)
             [fm, fb, fcnt, fmax] = major_reg_fit(m_seg_start_idx, major_min_grade, -1)
             if fcnt >= 3 and fmax > major_fit_atr * (na(atr14) ? 0.0 : atr14)
                 pc = major_prev_chain(m_seg_start_idx, major_min_grade, -1, found_idx)
-                finalize_channel(m_chain, bar_index)
-                finalize_channel(m_par, bar_index)
-                finalize_channel(m_cen, bar_index)
+                // Clean handoff: clip the old channel where the new one starts.
+                int hb = bar_index
+                if pc >= 0
+                    hb := array.get(piv_bars, pc)
+                register_major(m_chain, m_par, m_cen, hb)
                 m_chain := na
                 m_par   := na
                 m_cen   := na
@@ -1121,9 +1167,7 @@ if show_major and not na(m_chain) and m_leg_dir != 0
     mgn = major_break_margin_atr * (na(atr14) ? 0.0 : atr14)
     broke = m_leg_dir == 1 ? close < trend_y_now - mgn : close > trend_y_now + mgn
     if broke
-        finalize_channel(m_chain, bar_index)
-        finalize_channel(m_par, bar_index)
-        finalize_channel(m_cen, bar_index)
+        register_major(m_chain, m_par, m_cen, bar_index)
         m_chain := na
         m_par   := na
         m_cen   := na
