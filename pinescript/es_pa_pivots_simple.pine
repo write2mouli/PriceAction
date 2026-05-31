@@ -1,41 +1,27 @@
 //@version=5
 // ES PA Pivots SIMPLE - graded pivots + leg detection
 // ============================================================================
-// Step 1 of channel work: identify legs from pivots.
+// Same logic as before, but all global := mutations are now at top-level
+// script scope (Pine v5 forbids `var_name := ...` inside `=>` functions for
+// any variable declared outside the function). Functions are reduced to
+// pure helpers: color/style decisions, label creation, and array-only work
+// that does NOT touch the global state machine variables.
 //
-// A LEG is a directional move with a known range [anchor, extreme]:
-//   - UP leg:   anchor = leg-start LOW,  extreme = highest H since anchor
-//   - DOWN leg: anchor = leg-start HIGH, extreme = lowest L since anchor
+// Leg detection:
+//   EXTEND     -- pivot extends the current leg's extreme. GREEN (up) / RED (down).
+//   IN_RANGE   -- pivot stays in [anchor, extreme]. GRAY.
+//   TRANSITION -- pivot breaks anchor by >= leg_break_atr*ATR. BLACK on this
+//                 pivot AND retroactively on the prior leg's extreme.
+//   INIT       -- pre-direction.
 //
-// Each new pivot gets one of:
-//   EXTEND      -- extends the current leg's extreme (HH in UP, LL in DOWN)
-//                  GREEN in UP, RED in DOWN
-//   IN_RANGE    -- price is between anchor and extreme (consolidation /
-//                  pullback / counter-wiggle that stays within the leg)
-//                  GRAY
-//   TRANSITION  -- breaks beyond the leg's anchor by at least leg_break_atr*ATR
-//                  -> ends the current leg, starts the opposite-direction leg
-//                  BLACK on the breaking pivot AND retroactively on the prior
-//                  leg's extreme (so each finished leg has two black bookends)
-//   INIT        -- before the first leg direction is established
-//                  GRAY
-//
-// Pivot grading (multi-strength fractal):
-//   Grade C (default 1 bar each side)  = base detection, 3-bar fractal
-//   Grade B (default 3 bars each side) = upgrade
-//   Grade A (default 5 bars each side) = highest grade
-// Higher grade = bigger marker. A pivot starts at C and gets upgraded if a
-// wider fractal fires for the same bar.
-//
-// Structural label (HH/HL/LH/LL) is still computed per pivot relative to the
-// most recent same-kind pivot, and shown as text. The COLOR comes from the
-// leg state, not the slabural label.
+// Multi-strength grading: every pivot starts at Grade C (smallest fractal),
+// upgraded to B / A if a wider fractal fires for the same bar.
 // ============================================================================
 
 indicator("ES PA Pivots Simple", overlay=true, max_labels_count=500)
 
 // Inputs ---------------------------------------------------------------------
-strength_c = input.int(1, "Grade C strength (bars each side)", minval=1, maxval=10, tooltip="Smallest fractal; every C pivot is a strict local peak/trough over this many bars on each side.", group="Pivot grades")
+strength_c = input.int(1, "Grade C strength (bars each side)", minval=1, maxval=10, group="Pivot grades")
 strength_b = input.int(3, "Grade B strength", minval=2, maxval=20, group="Pivot grades")
 strength_a = input.int(5, "Grade A strength", minval=3, maxval=30, group="Pivot grades")
 
@@ -45,7 +31,7 @@ show_grade_c = input.bool(false, "Show Grade C (minor)",  group="Display")
 show_labels  = input.bool(true,  "Show HH/HL/LH/LL text labels", group="Display")
 show_ema     = input.bool(true,  "Show EMA21", group="Display")
 
-leg_break_atr = input.float(0.5, "Leg break threshold (xATR)", minval=0.0, maxval=3.0, step=0.05, tooltip="A pivot must break beyond the leg anchor by this many ATRs to count as a TRANSITION. 0 = any break flips the leg.", group="Legs")
+leg_break_atr = input.float(0.5, "Leg break threshold (xATR)", minval=0.0, maxval=3.0, step=0.05, group="Legs")
 use_leg_color = input.bool(true, "Color pivots by leg state (instead of HH/HL/LH/LL)", group="Legs")
 
 // EMA + ATR ------------------------------------------------------------------
@@ -64,21 +50,19 @@ pl_a_val = ta.pivotlow(low,  strength_a, strength_a)
 // Per-pivot tracking arrays --------------------------------------------------
 var array<int>    piv_bars       = array.new<int>(0)
 var array<float>  piv_prices     = array.new<float>(0)
-var array<int>    piv_kinds      = array.new<int>(0)     // 1=H, -1=L
-var array<int>    piv_grades     = array.new<int>(0)     // 1=C, 2=B, 3=A
-var array<string> piv_slabs    = array.new<string>(0)  // HH/HL/LH/LL/?
-var array<string> piv_leg_states = array.new<string>(0)  // EXTEND/IN_RANGE/TRANSITION/INIT
+var array<int>    piv_kinds      = array.new<int>(0)
+var array<int>    piv_grades     = array.new<int>(0)
+var array<string> piv_slabs      = array.new<string>(0)
+var array<string> piv_leg_states = array.new<string>(0)
 var array<label>  piv_labs       = array.new<label>(0)
 
+// Structural & leg state globals --------------------------------------------
 var float last_h_price = na
 var float last_l_price = na
-
-// Leg state ------------------------------------------------------------------
-// 0 = INIT, 1 = UP leg, 2 = DOWN leg
-var int   leg_dir         = 0
-var float leg_anchor      = na   // start price of current leg
-var float leg_extreme     = na   // farthest price in current direction
-var int   leg_extreme_idx = -1   // index in piv_* of the extreme pivot
+var int   leg_dir         = 0    // 0=INIT, 1=UP, 2=DOWN
+var float leg_anchor      = na
+var float leg_extreme     = na
+var int   leg_extreme_idx = -1
 
 // Counters
 var int n_hh = 0
@@ -91,7 +75,7 @@ var int n_b  = 0
 var int n_c  = 0
 var int n_legs = 0
 
-// Display helpers ------------------------------------------------------------
+// Pure helpers (no global mutation) -----------------------------------------
 size_for_grade(grade) =>
     grade == 3 ? size.large : grade == 2 ? size.normal : size.small
 
@@ -114,7 +98,7 @@ color_for_slab(slab) =>
 text_style_for_kind(kind) =>
     kind == 1 ? label.style_label_down : label.style_label_up
 
-// Draw label using leg state OR slabural color, per user toggle
+// Create a label (no global state mutation; just returns the label ref)
 draw_label_for(bx, bp, kind, slab, grade, leg_state) =>
     c = use_leg_color ? color_for_leg_state(leg_state) : color_for_slab(slab)
     if show_for_grade(grade)
@@ -125,113 +109,167 @@ draw_label_for(bx, bp, kind, slab, grade, leg_state) =>
     else
         label.new(bx, bp, "", color=color.new(color.gray, 100), style=label.style_none, size=size.tiny)
 
-// Compute leg state for a new pivot, mutating leg_dir / leg_anchor / etc.
-// Returns the leg_state string for this pivot.
-// `pivot_idx` is the index in piv_* arrays where this pivot was just pushed.
-process_leg(price, kind, pivot_idx) =>
-    out = "INIT"
-    thr = na(atr14) ? 0.0 : atr14 * leg_break_atr
-    if leg_dir == 0
-        if na(leg_anchor)
-            leg_anchor := price
-            out := "INIT"
+// Pure compute: leg state transition given current state.
+// Returns [out_state, new_dir, new_anchor, new_extreme, new_extreme_idx,
+//          legs_inc, retro_black_idx]
+//   legs_inc = 1 if this pivot starts a new leg (so we increment counter), 0 otherwise
+//   retro_black_idx = pivot array index whose label should be re-drawn as
+//                     TRANSITION (the prior leg's extreme), or -1 if none
+compute_leg_state(price, kind, pivot_idx, cur_dir, cur_anchor, cur_extreme, cur_extreme_idx, thr) =>
+    out_state = "INIT"
+    new_dir = cur_dir
+    new_anchor = cur_anchor
+    new_extreme = cur_extreme
+    new_extreme_idx = cur_extreme_idx
+    legs_inc = 0
+    retro_black_idx = -1
+    if cur_dir == 0
+        if na(cur_anchor)
+            new_anchor := price
+            out_state := "INIT"
         else
-            if price > leg_anchor + thr
-                leg_dir := 1
-                leg_extreme := price
-                leg_extreme_idx := pivot_idx
-                out := "EXTEND_UP"
-                n_legs := n_legs + 1
-            else if price < leg_anchor - thr
-                leg_dir := 2
-                leg_extreme := price
-                leg_extreme_idx := pivot_idx
-                out := "EXTEND_DN"
-                n_legs := n_legs + 1
+            if price > cur_anchor + thr
+                new_dir := 1
+                new_extreme := price
+                new_extreme_idx := pivot_idx
+                out_state := "EXTEND_UP"
+                legs_inc := 1
+            else if price < cur_anchor - thr
+                new_dir := 2
+                new_extreme := price
+                new_extreme_idx := pivot_idx
+                out_state := "EXTEND_DN"
+                legs_inc := 1
             else
-                out := "IN_RANGE"
-    else if leg_dir == 1
+                out_state := "IN_RANGE"
+    else if cur_dir == 1
         if kind == 1
-            if price > leg_extreme
-                leg_extreme := price
-                leg_extreme_idx := pivot_idx
-                out := "EXTEND_UP"
+            if price > cur_extreme
+                new_extreme := price
+                new_extreme_idx := pivot_idx
+                out_state := "EXTEND_UP"
             else
-                out := "IN_RANGE"
+                out_state := "IN_RANGE"
         else
-            if price > leg_anchor - thr
-                out := "IN_RANGE"
+            if price > cur_anchor - thr
+                out_state := "IN_RANGE"
             else
-                out := "TRANSITION"
-                // The prior leg_extreme becomes the END of the up leg. Mark it.
-                prev_extreme_idx = leg_extreme_idx
-                // Start new DOWN leg
-                leg_dir := 2
-                leg_anchor := array.get(piv_prices, prev_extreme_idx)
-                leg_extreme := price
-                leg_extreme_idx := pivot_idx
-                n_legs := n_legs + 1
-                // Retroactively re-label the prior extreme as TRANSITION
-                if prev_extreme_idx >= 0
-                    if prev_extreme_idx < array.size(piv_labs)
-                        old_lab = array.get(piv_labs, prev_extreme_idx)
-                        label.delete(old_lab)
-                        ex_bx = array.get(piv_bars, prev_extreme_idx)
-                        ex_bp = array.get(piv_prices, prev_extreme_idx)
-                        ex_kind = array.get(piv_kinds, prev_extreme_idx)
-                        ex_grade = array.get(piv_grades, prev_extreme_idx)
-                        ex_slab = array.get(piv_slabs, prev_extreme_idx)
-                        new_lab = draw_label_for(ex_bx, ex_bp, ex_kind, ex_slab, ex_grade, "TRANSITION")
-                        array.set(piv_labs, prev_extreme_idx, new_lab)
-                        array.set(piv_leg_states, prev_extreme_idx, "TRANSITION")
-    else if leg_dir == 2
+                out_state := "TRANSITION"
+                retro_black_idx := cur_extreme_idx
+                new_dir := 2
+                new_anchor := cur_extreme
+                new_extreme := price
+                new_extreme_idx := pivot_idx
+                legs_inc := 1
+    else if cur_dir == 2
         if kind == -1
-            if price < leg_extreme
-                leg_extreme := price
-                leg_extreme_idx := pivot_idx
-                out := "EXTEND_DN"
+            if price < cur_extreme
+                new_extreme := price
+                new_extreme_idx := pivot_idx
+                out_state := "EXTEND_DN"
             else
-                out := "IN_RANGE"
+                out_state := "IN_RANGE"
         else
-            if price < leg_anchor + thr
-                out := "IN_RANGE"
+            if price < cur_anchor + thr
+                out_state := "IN_RANGE"
             else
-                out := "TRANSITION"
-                prev_extreme_idx = leg_extreme_idx
-                leg_dir := 1
-                leg_anchor := array.get(piv_prices, prev_extreme_idx)
-                leg_extreme := price
-                leg_extreme_idx := pivot_idx
-                n_legs := n_legs + 1
-                if prev_extreme_idx >= 0
-                    if prev_extreme_idx < array.size(piv_labs)
-                        old_lab = array.get(piv_labs, prev_extreme_idx)
-                        label.delete(old_lab)
-                        ex_bx = array.get(piv_bars, prev_extreme_idx)
-                        ex_bp = array.get(piv_prices, prev_extreme_idx)
-                        ex_kind = array.get(piv_kinds, prev_extreme_idx)
-                        ex_grade = array.get(piv_grades, prev_extreme_idx)
-                        ex_slab = array.get(piv_slabs, prev_extreme_idx)
-                        new_lab = draw_label_for(ex_bx, ex_bp, ex_kind, ex_slab, ex_grade, "TRANSITION")
-                        array.set(piv_labs, prev_extreme_idx, new_lab)
-                        array.set(piv_leg_states, prev_extreme_idx, "TRANSITION")
-    out
+                out_state := "TRANSITION"
+                retro_black_idx := cur_extreme_idx
+                new_dir := 1
+                new_anchor := cur_extreme
+                new_extreme := price
+                new_extreme_idx := pivot_idx
+                legs_inc := 1
+    [out_state, new_dir, new_anchor, new_extreme, new_extreme_idx, legs_inc, retro_black_idx]
 
-// Register a brand-new pivot (smallest grade)
-register_new_pivot(bx, bp, kind) =>
-    slab = ""
-    if kind == 1
-        slab := na(last_h_price) ? "?" : (bp > last_h_price ? "HH" : "LH")
-        last_h_price := bp
-    else
-        slab := na(last_l_price) ? "?" : (bp < last_l_price ? "LL" : "HL")
-        last_l_price := bp
+// Array-only helper: find the latest pivot of (bar, kind) and upgrade its
+// grade label. Returns [old_grade, found_idx]; counters updated at caller.
+upgrade_pivot_grade(bx, kind, new_grade) =>
+    n = array.size(piv_bars)
+    found = -1
+    old_grade = 0
+    if n > 0
+        for i = n - 1 to 0 by -1
+            if array.get(piv_bars, i) == bx
+                if array.get(piv_kinds, i) == kind
+                    found := i
+                    break
+        if found >= 0
+            old_grade := array.get(piv_grades, found)
+            if new_grade > old_grade
+                array.set(piv_grades, found, new_grade)
+                old_lab = array.get(piv_labs, found)
+                label.delete(old_lab)
+                slab_v = array.get(piv_slabs, found)
+                bp = array.get(piv_prices, found)
+                leg_state_v = array.get(piv_leg_states, found)
+                new_lab = draw_label_for(bx, bp, kind, slab_v, new_grade, leg_state_v)
+                array.set(piv_labs, found, new_lab)
+    [old_grade, found]
+
+// Array-only helper: re-draw a pivot's label with a forced leg_state
+// (used for the retroactive TRANSITION marking on prior leg extreme).
+retag_label(idx, new_leg_state) =>
+    if idx >= 0
+        if idx < array.size(piv_labs)
+            old_lab = array.get(piv_labs, idx)
+            label.delete(old_lab)
+            ex_bx = array.get(piv_bars, idx)
+            ex_bp = array.get(piv_prices, idx)
+            ex_kind = array.get(piv_kinds, idx)
+            ex_grade = array.get(piv_grades, idx)
+            ex_slab = array.get(piv_slabs, idx)
+            new_lab = draw_label_for(ex_bx, ex_bp, ex_kind, ex_slab, ex_grade, new_leg_state)
+            array.set(piv_labs, idx, new_lab)
+            array.set(piv_leg_states, idx, new_leg_state)
+
+// === Process detections this bar ===========================================
+thr = na(atr14) ? 0.0 : atr14 * leg_break_atr
+
+// --- Grade C HIGH ---
+if not na(ph_c_val)
+    bx = bar_index - strength_c
+    bp = ph_c_val
+    // Structural label
+    slab = na(last_h_price) ? "?" : (bp > last_h_price ? "HH" : "LH")
+    last_h_price := bp
+    // Counters
     if slab == "HH"
         n_hh := n_hh + 1
-    else if slab == "HL"
-        n_hl := n_hl + 1
     else if slab == "LH"
         n_lh := n_lh + 1
+    else
+        n_q := n_q + 1
+    n_c := n_c + 1
+    // Push pivot record
+    array.push(piv_bars, bx)
+    array.push(piv_prices, bp)
+    array.push(piv_kinds, 1)
+    array.push(piv_grades, 1)
+    array.push(piv_slabs, slab)
+    new_idx = array.size(piv_bars) - 1
+    // Leg state compute
+    [leg_state, new_dir, new_anchor, new_extreme, new_extreme_idx, legs_inc, retro_idx] = compute_leg_state(bp, 1, new_idx, leg_dir, leg_anchor, leg_extreme, leg_extreme_idx, thr)
+    leg_dir := new_dir
+    leg_anchor := new_anchor
+    leg_extreme := new_extreme
+    leg_extreme_idx := new_extreme_idx
+    n_legs := n_legs + legs_inc
+    array.push(piv_leg_states, leg_state)
+    if retro_idx >= 0
+        retag_label(retro_idx, "TRANSITION")
+    // Draw this pivot's label
+    lab = draw_label_for(bx, bp, 1, slab, 1, leg_state)
+    array.push(piv_labs, lab)
+
+// --- Grade C LOW ---
+if not na(pl_c_val)
+    bx = bar_index - strength_c
+    bp = pl_c_val
+    slab = na(last_l_price) ? "?" : (bp < last_l_price ? "LL" : "HL")
+    last_l_price := bp
+    if slab == "HL"
+        n_hl := n_hl + 1
     else if slab == "LL"
         n_ll := n_ll + 1
     else
@@ -239,61 +277,57 @@ register_new_pivot(bx, bp, kind) =>
     n_c := n_c + 1
     array.push(piv_bars, bx)
     array.push(piv_prices, bp)
-    array.push(piv_kinds, kind)
+    array.push(piv_kinds, -1)
     array.push(piv_grades, 1)
     array.push(piv_slabs, slab)
     new_idx = array.size(piv_bars) - 1
-    leg_state = process_leg(bp, kind, new_idx)
+    [leg_state, new_dir, new_anchor, new_extreme, new_extreme_idx, legs_inc, retro_idx] = compute_leg_state(bp, -1, new_idx, leg_dir, leg_anchor, leg_extreme, leg_extreme_idx, thr)
+    leg_dir := new_dir
+    leg_anchor := new_anchor
+    leg_extreme := new_extreme
+    leg_extreme_idx := new_extreme_idx
+    n_legs := n_legs + legs_inc
     array.push(piv_leg_states, leg_state)
-    lab = draw_label_for(bx, bp, kind, slab, 1, leg_state)
+    if retro_idx >= 0
+        retag_label(retro_idx, "TRANSITION")
+    lab = draw_label_for(bx, bp, -1, slab, 1, leg_state)
     array.push(piv_labs, lab)
 
-// Find the most recent pivot of (bar, kind) and upgrade its grade
-upgrade_pivot(bx, kind, new_grade) =>
-    n = array.size(piv_bars)
-    if n > 0
-        found = -1
-        for i = n - 1 to 0 by -1
-            if array.get(piv_bars, i) == bx
-                if array.get(piv_kinds, i) == kind
-                    found := i
-                    break
-        if found >= 0
-            old_grade = array.get(piv_grades, found)
-            if new_grade > old_grade
-                if new_grade == 2
-                    n_b := n_b + 1
-                    n_c := n_c - 1
-                else if new_grade == 3
-                    n_a := n_a + 1
-                    if old_grade == 1
-                        n_c := n_c - 1
-                    else if old_grade == 2
-                        n_b := n_b - 1
-                array.set(piv_grades, found, new_grade)
-                old_lab = array.get(piv_labs, found)
-                label.delete(old_lab)
-                slab = array.get(piv_slabs, found)
-                bp = array.get(piv_prices, found)
-                leg_state = array.get(piv_leg_states, found)
-                new_lab = draw_label_for(bx, bp, kind, slab, new_grade, leg_state)
-                array.set(piv_labs, found, new_lab)
-
-// === Process detections this bar ===========================================
-if not na(ph_c_val)
-    register_new_pivot(bar_index - strength_c, ph_c_val, 1)
-if not na(pl_c_val)
-    register_new_pivot(bar_index - strength_c, pl_c_val, -1)
-
+// --- Grade B upgrades ---
 if not na(ph_b_val)
-    upgrade_pivot(bar_index - strength_b, 1, 2)
+    [old_g, found_idx] = upgrade_pivot_grade(bar_index - strength_b, 1, 2)
+    if found_idx >= 0
+        if old_g < 2
+            n_b := n_b + 1
+            if old_g == 1
+                n_c := n_c - 1
 if not na(pl_b_val)
-    upgrade_pivot(bar_index - strength_b, -1, 2)
+    [old_g, found_idx] = upgrade_pivot_grade(bar_index - strength_b, -1, 2)
+    if found_idx >= 0
+        if old_g < 2
+            n_b := n_b + 1
+            if old_g == 1
+                n_c := n_c - 1
 
+// --- Grade A upgrades ---
 if not na(ph_a_val)
-    upgrade_pivot(bar_index - strength_a, 1, 3)
+    [old_g, found_idx] = upgrade_pivot_grade(bar_index - strength_a, 1, 3)
+    if found_idx >= 0
+        if old_g < 3
+            n_a := n_a + 1
+            if old_g == 1
+                n_c := n_c - 1
+            else if old_g == 2
+                n_b := n_b - 1
 if not na(pl_a_val)
-    upgrade_pivot(bar_index - strength_a, -1, 3)
+    [old_g, found_idx] = upgrade_pivot_grade(bar_index - strength_a, -1, 3)
+    if found_idx >= 0
+        if old_g < 3
+            n_a := n_a + 1
+            if old_g == 1
+                n_c := n_c - 1
+            else if old_g == 2
+                n_b := n_b - 1
 
 // Status table ---------------------------------------------------------------
 var table tbl = table.new(position.top_right, 2, 10, bgcolor=color.new(color.gray, 80), border_width=1)
