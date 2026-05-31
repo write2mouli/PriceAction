@@ -1,116 +1,199 @@
 //@version=5
-// ES PA Pivots SIMPLE - minimal iterative indicator
+// ES PA Pivots SIMPLE - graded pivot detection
 // ============================================================================
-// Just finds every pivot and labels it HH/HL/LH/LL relative to the prior
-// same-kind pivot. No trend state machine, no BLACK extremes, no warnings,
-// no retroactive coloring. Build up complexity iteratively from here.
+// Every pivot is graded A / B / C by how wide a window it dominates:
+//   Grade C: strength_c bars each side (default 1, the basic 3-bar fractal)
+//   Grade B: strength_b bars each side (default 3 = 7-bar fractal)
+//   Grade A: strength_a bars each side (default 5 = 11-bar fractal)
 //
-// Pivot definition (Brooks-style with tie handling):
-//   - A bar is a pivot HIGH if it's the highest high in a window of
-//     `strength` bars on each side AND no later bar within that window has
-//     an equal-or-higher high (so equals on the LEFT count as the pivot but
-//     equals on the right disqualify -- "first bar of equal highs wins").
-//   - Symmetric for pivot LOW.
-//   - When equal highs/lows span more bars than the strength window, the
-//     pivot moves to the first bar of the equal run.
+// A pivot starts at Grade C when the smallest-window check confirms it.
+// It gets UPGRADED to B when the wider check fires for the same bar,
+// then to A when the widest fires. Grade reflects how isolated / important
+// the swing is -- A pivots anchor major channels, C pivots fill minor ones.
 //
-// Initial pivot:
-//   - Mark the first detected pivot with "?" since there's no prior to
-//     compare against.
-//   - All subsequent pivots get HH/HL/LH/LL.
+// Each pivot also gets a structural label HH / HL / LH / LL relative to
+// the prior same-kind pivot (Grade A vs C don't affect classification,
+// only marker size). First pivot is "?" (no prior).
 //
-// Default colors:
-//   HH = green up arrow (above bar)        -- breakout HIGH (made new high)
-//   HL = green up arrow (below bar)        -- within-range LOW (held above prior low)
-//   LH = red down arrow (above bar)        -- within-range HIGH (failed prior high)
-//   LL = red down arrow (below bar)        -- breakout LOW (broke prior low)
+// Display:
+//   Grade A pivots -> size.large arrow + label
+//   Grade B        -> size.normal
+//   Grade C        -> size.small (or hidden via toggle)
+//   Color:  HH / HL -> green   (bullish / holding above prior low)
+//           LH / LL -> red     (bearish / breaking prior low)
+//           ?       -> gray
 // ============================================================================
 
 indicator("ES PA Pivots Simple", overlay=true, max_labels_count=500)
 
 // Inputs ---------------------------------------------------------------------
-strength    = input.int(1, "Pivot strength (min bars each side)", minval=1, maxval=5, tooltip="Bars on each side for the fractal. 1 = simplest 3-bar pivot. Equal highs/lows extend the window automatically.", group="Pivot")
-show_labels = input.bool(true, "Show HH/HL/LH/LL text labels", group="Display")
-show_arrows = input.bool(true, "Show colored arrows", group="Display")
-show_ema    = input.bool(true, "Show EMA21", group="Display")
+strength_c = input.int(1, "Grade C strength (bars each side)", minval=1, maxval=10, tooltip="Smallest fractal; every C pivot is a strict local peak/trough over this many bars on each side.", group="Pivot grades")
+strength_b = input.int(3, "Grade B strength", minval=2, maxval=20, group="Pivot grades")
+strength_a = input.int(5, "Grade A strength", minval=3, maxval=30, group="Pivot grades")
+
+show_grade_a = input.bool(true,  "Show Grade A (major)",  group="Display")
+show_grade_b = input.bool(true,  "Show Grade B (medium)", group="Display")
+show_grade_c = input.bool(false, "Show Grade C (minor)",  group="Display")
+show_labels  = input.bool(true,  "Show HH/HL/LH/LL text labels", group="Display")
+show_ema     = input.bool(true,  "Show EMA21", group="Display")
 
 // EMA ------------------------------------------------------------------------
 ema21 = ta.ema(close, 21)
 plot(show_ema ? ema21 : na, "EMA21", color=color.blue, linewidth=1)
 
-// Pivot detection ------------------------------------------------------------
-// Use Pine's ta.pivothigh / ta.pivotlow. By default these use strict >/<
-// comparison. For equal handling, we'll add a flexible check below.
-ph_cand = ta.pivothigh(high, strength, strength)
-pl_cand = ta.pivotlow(low,  strength, strength)
-new_ph = not na(ph_cand)
-new_pl = not na(pl_cand)
-piv_bar = bar_index - strength
+// Multi-strength pivot detection --------------------------------------------
+ph_c_val = ta.pivothigh(high, strength_c, strength_c)
+ph_b_val = ta.pivothigh(high, strength_b, strength_b)
+ph_a_val = ta.pivothigh(high, strength_a, strength_a)
+pl_c_val = ta.pivotlow(low,  strength_c, strength_c)
+pl_b_val = ta.pivotlow(low,  strength_b, strength_b)
+pl_a_val = ta.pivotlow(low,  strength_a, strength_a)
 
-// Structural tracking --------------------------------------------------------
+// Tracking arrays (one slot per pivot, parallel arrays) ----------------------
+var array<int>    piv_bars    = array.new<int>(0)
+var array<float>  piv_prices  = array.new<float>(0)
+var array<int>    piv_kinds   = array.new<int>(0)     // 1=H, -1=L
+var array<int>    piv_grades  = array.new<int>(0)     // 1=C, 2=B, 3=A
+var array<string> piv_structs = array.new<string>(0)  // HH/HL/LH/LL/?
+var array<label>  piv_labs    = array.new<label>(0)
+
 var float last_h_price = na
 var float last_l_price = na
+
 // Counters for the status table
 var int n_hh = 0
 var int n_hl = 0
 var int n_lh = 0
 var int n_ll = 0
 var int n_q  = 0
+var int n_a  = 0
+var int n_b  = 0
+var int n_c  = 0
 
-// Pivot label/arrow draw helper.
-// kind: 1 = high, -1 = low
-// struct: "HH" / "HL" / "LH" / "LL" / "?"
-draw_pivot(x, y, kind, struct_lab) =>
-    // Color: green for HH/HL (bullish/holding), red for LH/LL (bearish/breaking),
-    // gray for first pivot "?"
-    out_c = color.gray
-    if struct_lab == "HH" or struct_lab == "HL"
-        out_c := color.new(color.green, 0)
-    else if struct_lab == "LH" or struct_lab == "LL"
-        out_c := color.new(color.red, 0)
-    // Arrow style: down arrow above for highs, up arrow below for lows
-    arrow_style = kind == 1 ? label.style_arrowdown : label.style_arrowup
-    text_style  = kind == 1 ? label.style_label_down : label.style_label_up
-    if show_arrows
-        label.new(x, y, "", color=out_c, style=arrow_style, textcolor=out_c, size=size.small)
-    if show_labels
-        // Text label sits a little further out so it doesn't overlap the arrow
-        label.new(x, y, struct_lab, color=color.new(out_c, 70), textcolor=out_c, style=text_style, size=size.small)
+// Helper: pick size constant per grade
+size_for_grade(grade) =>
+    grade == 3 ? size.large : grade == 2 ? size.normal : size.small
 
-// Process new HIGH pivot
-if new_ph
-    struct_h = na(last_h_price) ? "?" : (ph_cand > last_h_price ? "HH" : "LH")
-    if struct_h == "HH"
-        n_hh := n_hh + 1
-    else if struct_h == "LH"
-        n_lh := n_lh + 1
+// Helper: should this grade be displayed?
+show_for_grade(grade) =>
+    grade == 3 ? show_grade_a : grade == 2 ? show_grade_b : show_grade_c
+
+// Helper: color by struct
+color_for_struct(struct) =>
+    struct == "HH" or struct == "HL" ? color.green : struct == "LH" or struct == "LL" ? color.red : color.gray
+
+// Helper: text-label style by kind (high vs low)
+text_style_for_kind(kind) =>
+    kind == 1 ? label.style_label_down : label.style_label_up
+
+// Draw (or redraw on upgrade) the label for a pivot. Returns the label ref.
+draw_label_for(bx, bp, kind, struct, grade) =>
+    c = color_for_struct(struct)
+    if show_for_grade(grade)
+        sz = size_for_grade(grade)
+        style = text_style_for_kind(kind)
+        txt = show_labels ? struct : ""
+        label.new(bx, bp, txt, color=color.new(c, 70), textcolor=c, style=style, size=sz)
     else
-        n_q := n_q + 1
-    draw_pivot(piv_bar, ph_cand, 1, struct_h)
-    last_h_price := ph_cand
+        // Hidden placeholder so the array index stays in sync
+        label.new(bx, bp, "", color=color.new(color.gray, 100), style=label.style_none, size=size.tiny)
 
-// Process new LOW pivot
-if new_pl
-    struct_l = na(last_l_price) ? "?" : (pl_cand < last_l_price ? "LL" : "HL")
-    if struct_l == "HL"
+// Register a brand-new pivot at Grade C (smallest window first hit)
+register_new_pivot(bx, bp, kind) =>
+    struct = ""
+    if kind == 1
+        struct := na(last_h_price) ? "?" : (bp > last_h_price ? "HH" : "LH")
+        last_h_price := bp
+    else
+        struct := na(last_l_price) ? "?" : (bp < last_l_price ? "LL" : "HL")
+        last_l_price := bp
+    // Update counters
+    if struct == "HH"
+        n_hh := n_hh + 1
+    else if struct == "HL"
         n_hl := n_hl + 1
-    else if struct_l == "LL"
+    else if struct == "LH"
+        n_lh := n_lh + 1
+    else if struct == "LL"
         n_ll := n_ll + 1
     else
         n_q := n_q + 1
-    draw_pivot(piv_bar, pl_cand, -1, struct_l)
-    last_l_price := pl_cand
+    n_c := n_c + 1
+    // Push to arrays
+    array.push(piv_bars, bx)
+    array.push(piv_prices, bp)
+    array.push(piv_kinds, kind)
+    array.push(piv_grades, 1)
+    array.push(piv_structs, struct)
+    lab = draw_label_for(bx, bp, kind, struct, 1)
+    array.push(piv_labs, lab)
+
+// Find the most recent pivot of given (bar, kind) and upgrade its grade.
+upgrade_pivot(bx, kind, new_grade) =>
+    n = array.size(piv_bars)
+    if n > 0
+        // Search backward from most recent
+        found = -1
+        for i = n - 1 to 0 by -1
+            if array.get(piv_bars, i) == bx
+                if array.get(piv_kinds, i) == kind
+                    found := i
+                    break
+        if found >= 0
+            old_grade = array.get(piv_grades, found)
+            if new_grade > old_grade
+                if new_grade == 2
+                    n_b := n_b + 1
+                    n_c := n_c - 1
+                else if new_grade == 3
+                    n_a := n_a + 1
+                    if old_grade == 1
+                        n_c := n_c - 1
+                    else if old_grade == 2
+                        n_b := n_b - 1
+                array.set(piv_grades, found, new_grade)
+                old_lab = array.get(piv_labs, found)
+                label.delete(old_lab)
+                struct = array.get(piv_structs, found)
+                bp = array.get(piv_prices, found)
+                new_lab = draw_label_for(bx, bp, kind, struct, new_grade)
+                array.set(piv_labs, found, new_lab)
+
+// === Process detections this bar ===========================================
+// Grade C fires first (smallest window), so it registers new pivots.
+// Then Grade B / Grade A may fire later for the same bar, upgrading.
+
+if not na(ph_c_val)
+    register_new_pivot(bar_index - strength_c, ph_c_val, 1)
+if not na(pl_c_val)
+    register_new_pivot(bar_index - strength_c, pl_c_val, -1)
+
+if not na(ph_b_val)
+    upgrade_pivot(bar_index - strength_b, 1, 2)
+if not na(pl_b_val)
+    upgrade_pivot(bar_index - strength_b, -1, 2)
+
+if not na(ph_a_val)
+    upgrade_pivot(bar_index - strength_a, 1, 3)
+if not na(pl_a_val)
+    upgrade_pivot(bar_index - strength_a, -1, 3)
 
 // Status table ---------------------------------------------------------------
-var table tbl = table.new(position.top_right, 2, 5, bgcolor=color.new(color.gray, 80), border_width=1)
+var table tbl = table.new(position.top_right, 2, 9, bgcolor=color.new(color.gray, 80), border_width=1)
 if barstate.islast
-    table.cell(tbl, 0, 0, "HH", text_color=color.green, text_size=size.normal)
-    table.cell(tbl, 1, 0, str.tostring(n_hh), text_color=color.black, text_size=size.normal)
-    table.cell(tbl, 0, 1, "HL", text_color=color.green, text_size=size.normal)
-    table.cell(tbl, 1, 1, str.tostring(n_hl), text_color=color.black, text_size=size.normal)
-    table.cell(tbl, 0, 2, "LH", text_color=color.red, text_size=size.normal)
-    table.cell(tbl, 1, 2, str.tostring(n_lh), text_color=color.black, text_size=size.normal)
-    table.cell(tbl, 0, 3, "LL", text_color=color.red, text_size=size.normal)
-    table.cell(tbl, 1, 3, str.tostring(n_ll), text_color=color.black, text_size=size.normal)
-    table.cell(tbl, 0, 4, "?",  text_color=color.gray, text_size=size.normal)
-    table.cell(tbl, 1, 4, str.tostring(n_q),  text_color=color.black, text_size=size.normal)
+    table.cell(tbl, 0, 0, "Grade A", text_color=color.black, text_size=size.normal)
+    table.cell(tbl, 1, 0, str.tostring(n_a), text_color=color.black, text_size=size.normal)
+    table.cell(tbl, 0, 1, "Grade B", text_color=color.black, text_size=size.small)
+    table.cell(tbl, 1, 1, str.tostring(n_b), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 2, "Grade C", text_color=color.black, text_size=size.small)
+    table.cell(tbl, 1, 2, str.tostring(n_c), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 3, "HH", text_color=color.green, text_size=size.small)
+    table.cell(tbl, 1, 3, str.tostring(n_hh), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 4, "HL", text_color=color.green, text_size=size.small)
+    table.cell(tbl, 1, 4, str.tostring(n_hl), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 5, "LH", text_color=color.red,   text_size=size.small)
+    table.cell(tbl, 1, 5, str.tostring(n_lh), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 6, "LL", text_color=color.red,   text_size=size.small)
+    table.cell(tbl, 1, 6, str.tostring(n_ll), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 7, "?",  text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 7, str.tostring(n_q),  text_color=color.black, text_size=size.small)
