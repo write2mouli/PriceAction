@@ -18,7 +18,7 @@
 // upgraded to B / A if a wider fractal fires for the same bar.
 // ============================================================================
 
-indicator("ES PA Pivots Simple", overlay=true, max_labels_count=500)
+indicator("ES PA Pivots Simple", overlay=true, max_labels_count=500, max_lines_count=500)
 
 // Inputs ---------------------------------------------------------------------
 strength_c = input.int(1, "Grade C strength (bars each side)", minval=1, maxval=10, group="Pivot grades")
@@ -33,6 +33,10 @@ show_ema     = input.bool(true,  "Show EMA21", group="Display")
 
 leg_break_atr = input.float(0.5, "Leg break threshold (xATR)", minval=0.0, maxval=3.0, step=0.05, group="Legs")
 use_leg_color = input.bool(true, "Color pivots by leg state (instead of HH/HL/LH/LL)", group="Legs")
+
+show_channels  = input.bool(true, "Draw parallel channel per leg", group="Channels")
+channel_min_pivots = input.int(2, "Min HL/LH pivots needed to draw channel", minval=2, maxval=10, tooltip="Need at least this many HLs (UP) or LHs (DOWN) of any grade in the leg before a channel is drawn.", group="Channels")
+channel_extend = input.bool(true, "Extend channel lines to the right", group="Channels")
 
 // EMA + ATR ------------------------------------------------------------------
 atr14 = ta.atr(14)
@@ -75,6 +79,14 @@ var int   leg_extreme_h_idx = -1
 var int   leg_extreme_l_idx = -1
 var float leg_extreme_h_price = na
 var float leg_extreme_l_price = na
+
+// Index in piv_* arrays of the pivot that started the CURRENT leg.
+// On TRANSITION, we use this to know the leg's span [start, extreme] for
+// channel drawing, then advance it to the new leg's first pivot.
+var int   leg_start_pivot_idx = -1
+
+// All channel lines we've drawn (so we could prune older ones if needed).
+var array<line> channel_lines = array.new<line>(0)
 
 // Counters
 var int n_hh = 0
@@ -325,6 +337,47 @@ retag_label(idx, new_leg_state) =>
             array.set(piv_labs, idx, new_lab)
             array.set(piv_leg_states, idx, new_leg_state)
 
+// Draw a parallel channel for the leg spanning piv_* indices
+// [start_idx, extreme_idx]. Direction: 1 = UP leg, 2 = DOWN leg.
+// Trendline goes through the chain pivots (HLs for UP, LHs for DOWN);
+// parallel is offset through the leg's extreme (highest H for UP,
+// lowest L for DOWN).
+draw_channel_for_leg(start_idx, extreme_idx, leg_direction) =>
+    if show_channels
+        if start_idx >= 0
+            if extreme_idx >= start_idx
+                target_slab = leg_direction == 1 ? "HL" : "LH"
+                target_kind = leg_direction == 1 ? -1 : 1
+                first_match = -1
+                last_match = -1
+                n_chain = 0
+                for i = start_idx to extreme_idx
+                    cand_kind = array.get(piv_kinds, i)
+                    cand_slab = array.get(piv_slabs, i)
+                    if cand_kind == target_kind
+                        if cand_slab == target_slab
+                            if first_match < 0
+                                first_match := i
+                            last_match := i
+                            n_chain := n_chain + 1
+                if n_chain >= channel_min_pivots
+                    if last_match > first_match
+                        x1 = array.get(piv_bars, first_match)
+                        y1 = array.get(piv_prices, first_match)
+                        x2 = array.get(piv_bars, last_match)
+                        y2 = array.get(piv_prices, last_match)
+                        c = leg_direction == 1 ? color.green : color.red
+                        ext = channel_extend ? extend.right : extend.none
+                        tl = line.new(x1, y1, x2, y2, color=c, width=1, extend=ext)
+                        array.push(channel_lines, tl)
+                        slope = (y2 - y1) / (x2 - x1)
+                        ex_x = array.get(piv_bars, extreme_idx)
+                        ex_y = array.get(piv_prices, extreme_idx)
+                        y1p = ex_y + slope * (x1 - ex_x)
+                        y2p = ex_y + slope * (x2 - ex_x)
+                        pl = line.new(x1, y1p, x2, y2p, color=c, width=1, style=line.style_dashed, extend=ext)
+                        array.push(channel_lines, pl)
+
 // === Process detections this bar ===========================================
 thr = na(atr14) ? 0.0 : atr14 * leg_break_atr
 
@@ -354,6 +407,8 @@ if not na(ph_c_val)
     array.push(piv_grades, 1)
     array.push(piv_slabs, slab)
     new_idx = array.size(piv_bars) - 1
+    // Capture pre-call leg direction for channel drawing
+    old_leg_dir_h = leg_dir
     // Leg state compute (HL/LH chain)
     [leg_state, new_dir, new_last_hl, new_last_lh, new_eh_idx, new_el_idx, new_eh_price, new_el_price, legs_inc, retro_idx] = compute_leg_state(bp, 1, slab, new_idx, leg_dir, last_hl_price, last_lh_price, leg_extreme_h_idx, leg_extreme_l_idx, leg_extreme_h_price, leg_extreme_l_price, thr)
     leg_dir := new_dir
@@ -367,6 +422,13 @@ if not na(ph_c_val)
     array.push(piv_leg_states, leg_state)
     if retro_idx >= 0
         retag_label(retro_idx, "TRANSITION")
+        // Draw channel for the leg that just ended
+        if leg_start_pivot_idx >= 0
+            draw_channel_for_leg(leg_start_pivot_idx, retro_idx, old_leg_dir_h)
+        leg_start_pivot_idx := new_idx
+    else if legs_inc == 1
+        // First leg from INIT
+        leg_start_pivot_idx := new_idx
     // Draw this pivot's label
     lab = draw_label_for(bx, bp, 1, slab, 1, leg_state)
     array.push(piv_labs, lab)
@@ -392,6 +454,7 @@ if not na(pl_c_val)
     array.push(piv_grades, 1)
     array.push(piv_slabs, slab)
     new_idx = array.size(piv_bars) - 1
+    old_leg_dir_l = leg_dir
     [leg_state, new_dir, new_last_hl, new_last_lh, new_eh_idx, new_el_idx, new_eh_price, new_el_price, legs_inc, retro_idx] = compute_leg_state(bp, -1, slab, new_idx, leg_dir, last_hl_price, last_lh_price, leg_extreme_h_idx, leg_extreme_l_idx, leg_extreme_h_price, leg_extreme_l_price, thr)
     leg_dir := new_dir
     last_hl_price := new_last_hl
@@ -404,6 +467,11 @@ if not na(pl_c_val)
     array.push(piv_leg_states, leg_state)
     if retro_idx >= 0
         retag_label(retro_idx, "TRANSITION")
+        if leg_start_pivot_idx >= 0
+            draw_channel_for_leg(leg_start_pivot_idx, retro_idx, old_leg_dir_l)
+        leg_start_pivot_idx := new_idx
+    else if legs_inc == 1
+        leg_start_pivot_idx := new_idx
     lab = draw_label_for(bx, bp, -1, slab, 1, leg_state)
     array.push(piv_labs, lab)
 
