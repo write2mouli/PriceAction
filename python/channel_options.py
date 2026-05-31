@@ -39,6 +39,8 @@ from matplotlib.patches import Rectangle  # noqa: E402
 from channels_yahoo_test import fetch_es_2m, atr  # reuse data + ATR
 import json, urllib.request
 
+HL_DEBUG = False  # diagnostic off
+
 
 def fetch_es(interval="2m"):
     """Fetch /ES OHLC at the given interval from Yahoo (urllib, no pandas)."""
@@ -679,16 +681,28 @@ def method_hl_chain(legs, pivs, h, l, c, min_grade, atr_v,
 
         def emit(chain_seg, choch, temps):
             if len(chain_seg) < 2:
+                if HL_DEBUG:
+                    print(f"    [skip] dir={lg.direction} chain<2 ({len(chain_seg)})")
                 return
             m, b_reg = _regress([p.idx for p in chain_seg], [p.price for p in chain_seg])
             if m is None:
                 return
             x0 = chain_seg[0].idx
             x1p = chain_seg[-1].idx
-            if min_move_atr > 0 and abs(m * (x1p - x0)) < min_move_atr * atr_v[x1p]:
-                return
             end_idx = choch.idx if choch else (n - 1)
             span = [p for p in lp if x0 <= p.idx <= end_idx]
+            # Trend-quality = the leg's PRICE amplitude (high-low of its pivots),
+            # NOT the chain-slope projection. A fast drop has flat/sparse highs
+            # (chain slope ~0) but a big price range -- the old chain-slope metric
+            # wrongly filtered such downtrends as chop.
+            sp = [p.price for p in span] or [p.price for p in chain_seg]
+            mv = max(sp) - min(sp)
+            if min_move_atr > 0 and mv < min_move_atr * atr_v[x1p]:
+                if HL_DEBUG:
+                    print(f"    [skip] dir={lg.direction} amp {mv:.1f} < {min_move_atr*atr_v[x1p]:.1f} (bars {x0}-{x1p})")
+                return
+            if HL_DEBUG:
+                print(f"    [EMIT] dir={lg.direction} chain={len(chain_seg)} amp {mv:.1f} bars {x0}-{x1p}")
             tol = atr_v[x1p] * 0.4
             # Trend-side rail = the regression line THROUGH the chain pivots (the
             # rising lows for UP). Best fit => hugs the swing pivots with the least

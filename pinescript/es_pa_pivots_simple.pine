@@ -49,13 +49,13 @@ broad_min_run = input.int(3, "Range merge: consecutive small legs to merge", min
 // minor green/red ones -- the steep impulse and the broad grind each as ONE.
 show_major = input.bool(true, "Draw major-scale channels (cyan)", group="Major channels")
 major_min_grade = input.int(3, "Major: min pivot grade for channel touches (3=A, 2=B+)", minval=2, maxval=3, tooltip="Leg structure is always defined by Grade-A swings; this controls which pivots the channel regression rides. 3 (A only) matches the validated Python prototype -- cleaner. 2 (B+) adds more touch points if the channels look too sparse.", group="Major channels")
-major_break_atr = input.float(2.0, "Major: break threshold (xATR)", minval=0.25, maxval=8.0, step=0.25, tooltip="Higher = fewer, broader major legs. A major leg only reverses when a Grade-A pivot breaks its HL/LH chain by this many ATRs. Raise it if the trend keeps flipping UP/DOWN on pullbacks (opposite-color channels crossing).", group="Major channels")
+major_break_atr = input.float(2.0, "Major: break threshold (xATR)", minval=0.25, maxval=8.0, step=0.25, tooltip="A major leg reverses when a Grade-A pivot breaks its HL/LH chain by this many ATRs. 2.0 keeps uptrends clean (pullbacks don't flip the leg). Lowering it captures smaller downtrends but flip-flops -- the anomaly-confirmation step (pending breach confirmed by a lower high) is what lets a low threshold capture downtrends WITHOUT flip-flop.", group="Major channels")
 major_keep = input.int(24, "Major: keep only the last N channels", minval=1, maxval=200, tooltip="Caps how many finalized major channels stay on the chart, so they don't pile up infinitely across all loaded history. With ~6-8 clean channels per day, 24 keeps roughly the last 3 trading days. Raise it to see more history; lower it to declutter when zoomed in.", group="Major channels")
 major_min_move_atr = input.float(2.5, "Major: min trend move to draw a channel (xATR)", minval=0.0, maxval=15.0, step=0.5, tooltip="Trend-quality filter. A segment only draws a channel once its net directional travel (|slope x span|) reaches this many ATRs. Chop goes nowhere, so it stays blank -- the channel emerges progressively as a real trend develops. Raise it to suppress more chop / only show strong trends; 0 disables the filter.", group="Major channels")
 major_touch_atr = input.float(0.4, "Major: pivot touch tolerance (xATR)", minval=0.05, maxval=2.0, step=0.05, tooltip="How close a pivot must sit to a rail to count as a TOUCH. Each rail's offset is chosen to land on the MOST pivots within this tolerance while letting at most 2 poke out as anomalies, so the support (UP) / resistance (DOWN) rides the pivot cluster cleanly.", group="Major channels")
 show_breach = input.bool(true, "Mark support/resistance breach", tooltip="For an uptrend the channel is about the SUPPORT and its BREACH: mark an X at the bar where price first CLOSES below support (UP) / above resistance (DOWN), which is where the channel ends.", group="Major channels")
 major_width = input.int(3, "Major: line width (px)", minval=1, maxval=6, group="Major channels")
-major_fit_atr = input.float(2.5, "Major: regression fit tolerance (xATR)", minval=0.25, maxval=8.0, step=0.1, tooltip="Piecewise regression (spike-and-channel). A segment splits only when its support-pivot regression stops fitting by this many ATRs -- so a BIG slope change (spike->grind) splits, but the grind's minor wiggles do NOT, keeping a trend as ONE long channel. Lower it to split more readily; raise it for fewer, longer channels.", group="Major channels")
+major_fit_atr = input.float(1.5, "Major: regression fit tolerance (xATR)", minval=0.25, maxval=8.0, step=0.1, tooltip="Piecewise regression (spike-and-channel). A segment splits when its support-pivot regression stops fitting by this many ATRs -- a slope change in EITHER direction (steep spike -> flat grind, or flat -> steep) starts a fresh support. Lower = splits more readily; higher = fewer, longer channels. 1.5 separates the spike from the grind (validated Python W1).", group="Major channels")
 major_break_margin_atr = input.float(0.25, "Major: clean-break margin (xATR)", minval=0.0, maxval=2.0, step=0.05, tooltip="A channel ends only when a bar CLOSES beyond its trend-side line (support for UP / resistance for DOWN) by at least this many ATRs -- a CLEAN break, not a marginal poke. Raise it if downtrends fragment into many short channels because normal bounces nick the resistance.", group="Major channels")
 
 // EMA + ATR ------------------------------------------------------------------
@@ -672,7 +672,7 @@ best_offset_for(seg_start_idx, slope, min_grade, want_kind, tol, max_anom, count
 //            drift). If na, the hull slope is computed. The slope actually used
 //            is returned so the caller can lock it after the first valid draw.
 // Returns [new_chain, new_parallel, new_center, n_chain_found, used_slope]
-update_current_channel(leg_direction, leg_start_idx, cur_chain, cur_par, cur_cen, min_grade, maj, float in_locked_slope) =>
+update_current_channel(leg_direction, leg_start_idx, cur_chain, cur_par, cur_cen, min_grade, maj, float in_locked_slope, float trend_b) =>
     new_chain = cur_chain
     new_par   = cur_par
     new_cen   = cur_cen
@@ -745,20 +745,15 @@ update_current_channel(leg_direction, leg_start_idx, cur_chain, cur_par, cur_cen
                 if maj
                     tol_t = major_touch_atr * (na(atr14) ? 0.0 : atr14)
                     if leg_direction == 1
-                        // SUPPORT (trend-side, THE line): ride the low CLUSTER over
-                        // all grades, letting the <=2 deepest wicks poke below as
-                        // anomalies -- clean, less undershoot. Its breach (a close
-                        // below it) is what ends the uptrend.
-                        boL = best_offset_for(leg_start_idx, slope, 1, -1, tol_t, 2, false)
-                        r_min := na(boL) ? rmin1 : boL
-                        // upper rail (context): max-touch over major highs, <=2 above
+                        // SUPPORT (trend-side) = the regression line THROUGH the
+                        // chain lows (trend_b = its intercept). Best fit hugs the
+                        // swing pivots with the least white space. Upper = max-touch.
+                        r_min := na(trend_b) ? rmin1 : trend_b
                         boU = best_offset_for(leg_start_idx, slope, min_grade, 1, tol_t, 2, true)
                         r_max := na(boU) ? rmax1 : boU
                     else
-                        // RESISTANCE (trend-side, THE line): ride the high cluster,
-                        // <=2 above; its breach (close above) ends the downtrend.
-                        boU = best_offset_for(leg_start_idx, slope, 1, 1, tol_t, 2, true)
-                        r_max := na(boU) ? rmax1 : boU
+                        // RESISTANCE = regression line through the chain highs.
+                        r_max := na(trend_b) ? rmax1 : trend_b
                         boL = best_offset_for(leg_start_idx, slope, min_grade, -1, tol_t, 2, false)
                         r_min := na(boL) ? rmin1 : boL
                 left_x  = array.get(piv_bars, leg_start_idx)
@@ -836,6 +831,21 @@ major_prev_chain(seg_start_idx, min_grade, chain_kind, before_idx) =>
             if array.get(piv_kinds, i) == chain_kind and array.get(piv_grades, i) >= min_grade
                 res := i
     res
+
+// Price AMPLITUDE (max-min) of the segment's pivots -- the trend-quality metric.
+// A fast drop has flat/sparse highs (so the resistance-chain slope ~0) but a big
+// price range, so measuring amplitude instead of chain-slope keeps downtrends
+// from being wrongly filtered as chop.
+major_amp(seg_start_idx) =>
+    n = array.size(piv_bars)
+    float hi = -1.0e18
+    float lo =  1.0e18
+    if seg_start_idx >= 0
+        for i = seg_start_idx to n - 1
+            p = array.get(piv_prices, i)
+            hi := math.max(hi, p)
+            lo := math.min(lo, p)
+    hi - lo
 
 // === Process detections this bar ===========================================
 thr = na(atr14) ? 0.0 : atr14 * leg_break_atr
@@ -931,7 +941,7 @@ if not na(ph_c_val)
     array.push(piv_labs, lab)
     // Adaptive channel update for the current epoch
     if leg_dir != 0
-        [new_tl, new_pl, new_cn, dbg_n, _mus] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel, cur_leg_center, 1, false, na)
+        [new_tl, new_pl, new_cn, dbg_n, _mus] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel, cur_leg_center, 1, false, na, na)
         cur_leg_trendline := new_tl
         cur_leg_parallel := new_pl
         cur_leg_center := new_cn
@@ -996,7 +1006,7 @@ if not na(pl_c_val)
     lab = draw_label_for(bx, bp, -1, slab, 1, leg_state)
     array.push(piv_labs, lab)
     if leg_dir != 0
-        [new_tl, new_pl, new_cn, dbg_n, _mus] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel, cur_leg_center, 1, false, na)
+        [new_tl, new_pl, new_cn, dbg_n, _mus] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel, cur_leg_center, 1, false, na, na)
         cur_leg_trendline := new_tl
         cur_leg_parallel := new_pl
         cur_leg_center := new_cn
@@ -1076,8 +1086,10 @@ if not na(ph_a_val)
         m_eh_price := m_nehp
         m_el_price := m_nelp
         if m_retro >= 0
-            // Major CHoCH reversal: finalize the live segment, start a fresh
-            // leg + segment anchored at the CHoCH pivot (prior leg extreme).
+            // Major CHoCH: a higher high broke the downtrend's resistance chain
+            // -> change of character UP. Mark it, finalize the segment, restart.
+            if show_breach and show_major
+                label.new(array.get(piv_bars, found_idx), array.get(piv_prices, found_idx), "X", style=label.style_label_down, color=color.new(color.fuchsia, 0), textcolor=color.white, size=size.small)
             register_major(m_chain, m_par, m_cen, bar_index)
             m_chain := na
             m_par   := na
@@ -1119,11 +1131,10 @@ if not na(ph_a_val)
             // it's chop -> stays blank; the channel emerges progressively as a
             // real trend develops. (A chop segment that never draws also never
             // registers, so it can't flood the keep-N buffer.)
-            seg_left_bar = array.get(piv_bars, m_seg_start_idx)
-            net_move = na(rm) ? 0.0 : math.abs(rm * (bar_index - seg_left_bar))
+            seg_amp = major_amp(m_seg_start_idx)
             mv_thr = major_min_move_atr * (na(atr14) ? 0.0 : atr14)
-            if rcnt >= 2 and not na(rm) and net_move >= mv_thr
-                [mc, mp, mcen, mdb, mused] = update_current_channel(m_leg_dir, m_seg_start_idx, m_chain, m_par, m_cen, major_min_grade, true, rm)
+            if rcnt >= 2 and not na(rm) and seg_amp >= mv_thr
+                [mc, mp, mcen, mdb, mused] = update_current_channel(m_leg_dir, m_seg_start_idx, m_chain, m_par, m_cen, major_min_grade, true, rm, rb)
                 m_chain := mc
                 m_par   := mp
                 m_cen   := mcen
@@ -1160,6 +1171,10 @@ if not na(pl_a_val)
         m_eh_price := m_nehp
         m_el_price := m_nelp
         if m_retro >= 0
+            // Major CHoCH: a lower low broke the uptrend's SUPPORT chain ->
+            // change of character DOWN. Mark it, finalize the segment, restart.
+            if show_breach and show_major
+                label.new(array.get(piv_bars, found_idx), array.get(piv_prices, found_idx), "X", style=label.style_label_up, color=color.new(color.fuchsia, 0), textcolor=color.white, size=size.small)
             register_major(m_chain, m_par, m_cen, bar_index)
             m_chain := na
             m_par   := na
@@ -1194,39 +1209,21 @@ if not na(pl_a_val)
             // it's chop -> stays blank; the channel emerges progressively as a
             // real trend develops. (A chop segment that never draws also never
             // registers, so it can't flood the keep-N buffer.)
-            seg_left_bar = array.get(piv_bars, m_seg_start_idx)
-            net_move = na(rm) ? 0.0 : math.abs(rm * (bar_index - seg_left_bar))
+            seg_amp = major_amp(m_seg_start_idx)
             mv_thr = major_min_move_atr * (na(atr14) ? 0.0 : atr14)
-            if rcnt >= 2 and not na(rm) and net_move >= mv_thr
-                [mc, mp, mcen, mdb, mused] = update_current_channel(m_leg_dir, m_seg_start_idx, m_chain, m_par, m_cen, major_min_grade, true, rm)
+            if rcnt >= 2 and not na(rm) and seg_amp >= mv_thr
+                [mc, mp, mcen, mdb, mused] = update_current_channel(m_leg_dir, m_seg_start_idx, m_chain, m_par, m_cen, major_min_grade, true, rm, rb)
                 m_chain := mc
                 m_par   := mp
                 m_cen   := mcen
 
-// Major channel termination (every bar): a channel extends to the right until
-// price CLOSES beyond its trend-side line -- UP: close < support / DOWN: close >
-// resistance. That clean break finalizes the channel here (not at the next
-// pivot); the segment then restarts at the next major pivot. m_chain is the
-// support line for UP / resistance line for DOWN (see update_current_channel).
-if show_major and not na(m_chain) and m_leg_dir != 0
-    cx1 = line.get_x1(m_chain)
-    cy1 = line.get_y1(m_chain)
-    cx2 = line.get_x2(m_chain)
-    cy2 = line.get_y2(m_chain)
-    csl = cx2 != cx1 ? (cy2 - cy1) / (cx2 - cx1) : 0.0
-    trend_y_now = cy1 + csl * (bar_index - cx1)
-    mgn = major_break_margin_atr * (na(atr14) ? 0.0 : atr14)
-    broke = m_leg_dir == 1 ? close < trend_y_now - mgn : close > trend_y_now + mgn
-    if broke
-        // Mark the breach: this is the signal an uptrend's SUPPORT (or a
-        // downtrend's resistance) was closed through -- where the channel ends.
-        if show_breach
-            label.new(bar_index, close, "X", style=(m_leg_dir == 1 ? label.style_label_up : label.style_label_down), color=color.new(color.fuchsia, 0), textcolor=color.white, size=size.small)
-        register_major(m_chain, m_par, m_cen, bar_index)
-        m_chain := na
-        m_par   := na
-        m_cen   := na
-        m_seg_start_idx := -1
+// (The breach is now STRUCTURAL: the major leg's CHoCH transition -- a hard
+// lower low for an uptrend / higher high for a downtrend -- which is detected in
+// the Grade-A blocks above and marked with an X there. The old per-bar
+// close-below-the-line termination was removed: with the support drawn as the
+// regression line through the lows (mid of the cluster), a close-below test
+// false-fires on every pullback. A close below the AVERAGE low isn't a break;
+// a lower swing low is.)
 
 // Status table ---------------------------------------------------------------
 var table tbl = table.new(position.top_right, 2, 13, bgcolor=color.new(color.gray, 80), border_width=1)
