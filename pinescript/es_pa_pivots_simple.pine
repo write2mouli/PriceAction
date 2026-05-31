@@ -1,0 +1,116 @@
+//@version=5
+// ES PA Pivots SIMPLE - minimal iterative indicator
+// ============================================================================
+// Just finds every pivot and labels it HH/HL/LH/LL relative to the prior
+// same-kind pivot. No trend state machine, no BLACK extremes, no warnings,
+// no retroactive coloring. Build up complexity iteratively from here.
+//
+// Pivot definition (Brooks-style with tie handling):
+//   - A bar is a pivot HIGH if it's the highest high in a window of
+//     `strength` bars on each side AND no later bar within that window has
+//     an equal-or-higher high (so equals on the LEFT count as the pivot but
+//     equals on the right disqualify -- "first bar of equal highs wins").
+//   - Symmetric for pivot LOW.
+//   - When equal highs/lows span more bars than the strength window, the
+//     pivot moves to the first bar of the equal run.
+//
+// Initial pivot:
+//   - Mark the first detected pivot with "?" since there's no prior to
+//     compare against.
+//   - All subsequent pivots get HH/HL/LH/LL.
+//
+// Default colors:
+//   HH = green up arrow (above bar)        -- breakout HIGH (made new high)
+//   HL = green up arrow (below bar)        -- within-range LOW (held above prior low)
+//   LH = red down arrow (above bar)        -- within-range HIGH (failed prior high)
+//   LL = red down arrow (below bar)        -- breakout LOW (broke prior low)
+// ============================================================================
+
+indicator("ES PA Pivots Simple", overlay=true, max_labels_count=500)
+
+// Inputs ---------------------------------------------------------------------
+strength    = input.int(1, "Pivot strength (min bars each side)", minval=1, maxval=5, tooltip="Bars on each side for the fractal. 1 = simplest 3-bar pivot. Equal highs/lows extend the window automatically.", group="Pivot")
+show_labels = input.bool(true, "Show HH/HL/LH/LL text labels", group="Display")
+show_arrows = input.bool(true, "Show colored arrows", group="Display")
+show_ema    = input.bool(true, "Show EMA21", group="Display")
+
+// EMA ------------------------------------------------------------------------
+ema21 = ta.ema(close, 21)
+plot(show_ema ? ema21 : na, "EMA21", color=color.blue, linewidth=1)
+
+// Pivot detection ------------------------------------------------------------
+// Use Pine's ta.pivothigh / ta.pivotlow. By default these use strict >/<
+// comparison. For equal handling, we'll add a flexible check below.
+ph_cand = ta.pivothigh(high, strength, strength)
+pl_cand = ta.pivotlow(low,  strength, strength)
+new_ph = not na(ph_cand)
+new_pl = not na(pl_cand)
+piv_bar = bar_index - strength
+
+// Structural tracking --------------------------------------------------------
+var float last_h_price = na
+var float last_l_price = na
+// Counters for the status table
+var int n_hh = 0
+var int n_hl = 0
+var int n_lh = 0
+var int n_ll = 0
+var int n_q  = 0
+
+// Pivot label/arrow draw helper.
+// kind: 1 = high, -1 = low
+// struct: "HH" / "HL" / "LH" / "LL" / "?"
+draw_pivot(x, y, kind, struct_lab) =>
+    // Color: green for HH/HL (bullish/holding), red for LH/LL (bearish/breaking),
+    // gray for first pivot "?"
+    out_c = color.gray
+    if struct_lab == "HH" or struct_lab == "HL"
+        out_c := color.new(color.green, 0)
+    else if struct_lab == "LH" or struct_lab == "LL"
+        out_c := color.new(color.red, 0)
+    // Arrow style: down arrow above for highs, up arrow below for lows
+    arrow_style = kind == 1 ? label.style_arrowdown : label.style_arrowup
+    text_style  = kind == 1 ? label.style_label_down : label.style_label_up
+    if show_arrows
+        label.new(x, y, "", color=out_c, style=arrow_style, textcolor=out_c, size=size.small)
+    if show_labels
+        // Text label sits a little further out so it doesn't overlap the arrow
+        label.new(x, y, struct_lab, color=color.new(out_c, 70), textcolor=out_c, style=text_style, size=size.small)
+
+// Process new HIGH pivot
+if new_ph
+    struct_h = na(last_h_price) ? "?" : (ph_cand > last_h_price ? "HH" : "LH")
+    if struct_h == "HH"
+        n_hh := n_hh + 1
+    else if struct_h == "LH"
+        n_lh := n_lh + 1
+    else
+        n_q := n_q + 1
+    draw_pivot(piv_bar, ph_cand, 1, struct_h)
+    last_h_price := ph_cand
+
+// Process new LOW pivot
+if new_pl
+    struct_l = na(last_l_price) ? "?" : (pl_cand < last_l_price ? "LL" : "HL")
+    if struct_l == "HL"
+        n_hl := n_hl + 1
+    else if struct_l == "LL"
+        n_ll := n_ll + 1
+    else
+        n_q := n_q + 1
+    draw_pivot(piv_bar, pl_cand, -1, struct_l)
+    last_l_price := pl_cand
+
+// Status table ---------------------------------------------------------------
+var table tbl = table.new(position.top_right, 2, 5, bgcolor=color.new(color.gray, 80), border_width=1)
+if barstate.islast
+    table.cell(tbl, 0, 0, "HH", text_color=color.green, text_size=size.normal)
+    table.cell(tbl, 1, 0, str.tostring(n_hh), text_color=color.black, text_size=size.normal)
+    table.cell(tbl, 0, 1, "HL", text_color=color.green, text_size=size.normal)
+    table.cell(tbl, 1, 1, str.tostring(n_hl), text_color=color.black, text_size=size.normal)
+    table.cell(tbl, 0, 2, "LH", text_color=color.red, text_size=size.normal)
+    table.cell(tbl, 1, 2, str.tostring(n_lh), text_color=color.black, text_size=size.normal)
+    table.cell(tbl, 0, 3, "LL", text_color=color.red, text_size=size.normal)
+    table.cell(tbl, 1, 3, str.tostring(n_ll), text_color=color.black, text_size=size.normal)
+    table.cell(tbl, 0, 4, "?",  text_color=color.gray, text_size=size.normal)
+    table.cell(tbl, 1, 4, str.tostring(n_q),  text_color=color.black, text_size=size.normal)
