@@ -37,6 +37,25 @@ import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.patches import Rectangle  # noqa: E402
 
 from channels_yahoo_test import fetch_es_2m, atr  # reuse data + ATR
+import json, urllib.request
+
+
+def fetch_es(interval="2m"):
+    """Fetch /ES OHLC at the given interval from Yahoo (urllib, no pandas)."""
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/ES=F"
+           f"?interval={interval}&range=5d")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        d = json.loads(r.read())
+    res = d["chart"]["result"][0]
+    ts = np.array(res["timestamp"], dtype=np.int64)
+    q = res["indicators"]["quote"][0]
+    o = np.array(q["open"], dtype=float)
+    h = np.array(q["high"], dtype=float)
+    l = np.array(q["low"], dtype=float)
+    c = np.array(q["close"], dtype=float)
+    ok = ~(np.isnan(o) | np.isnan(h) | np.isnan(l) | np.isnan(c))
+    return ts[ok], o[ok], h[ok], l[ok], c[ok]
 
 
 # ----------------------------------------------------------------------------
@@ -208,10 +227,11 @@ def run_leg_machine(pivs: List[Piv], atr_v, break_atr: float,
 class ChannelSeg:
     x0: int
     x1: int
-    slope: float
-    sup_b: float      # support intercept (lower line for UP)
-    res_b: float      # resist intercept  (upper line for UP)
+    slope: float          # lower-line slope
+    sup_b: float          # lower-line intercept (support for UP)
+    res_b: float          # upper-line intercept (resistance for UP)
     direction: int
+    hi_slope: float = None  # upper-line slope; None -> parallel (use `slope`)
 
 
 def _regress(xs, ys):
@@ -353,12 +373,17 @@ def _band_robust(slope, pivs: List[Piv], direction, top_pct):
 
 
 def _emit_robust(segs, seg_chain, leg_pivs, direction, top_pct, c, n,
-                 atr_v=None, margin_atr=0.25):
+                 atr_v=None, margin_atr=0.25, min_move_atr=0.0):
     """Robust band + extend the channel to the right until a bar CLOSES beyond
     the trend-side line by a CLEAN-break margin (UP: close < support - margin /
     DOWN: close > resistance + margin). The margin stops normal bounces from
     snapping the channel (esp. downtrends). If price never breaks, extend to the
-    session end."""
+    session end.
+
+    TREND-QUALITY filter: skip the segment unless its net directional travel
+    (|slope x span|) is at least min_move_atr x ATR. Chop segments go nowhere, so
+    this suppresses the pile of micro-channels in ranges and keeps only real
+    trend channels."""
     if len(seg_chain) < 2:
         return
     m, _ = _regress([p.idx for p in seg_chain], [p.price for p in seg_chain])
@@ -366,6 +391,10 @@ def _emit_robust(segs, seg_chain, leg_pivs, direction, top_pct, c, n,
         return
     x0 = seg_chain[0].idx
     x1 = seg_chain[-1].idx
+    if min_move_atr > 0 and atr_v is not None:
+        net_move = abs(m * (x1 - x0))
+        if net_move < min_move_atr * atr_v[x1]:
+            return
     inside = [p for p in leg_pivs if x0 <= p.idx <= x1] or seg_chain
     sup_b, res_b = _band_robust(m, inside, direction, top_pct)
     x1e = n - 1
@@ -379,8 +408,10 @@ def _emit_robust(segs, seg_chain, leg_pivs, direction, top_pct, c, n,
 
 
 def method_piecewise_robust(legs, pivs, h, l, c, min_grade, atr_v,
-                            tol_atr=1.2, top_pct=85, margin_atr=0.25) -> List[ChannelSeg]:
-    """method F + robust trimmed band + extend-until-support-break."""
+                            tol_atr=1.2, top_pct=85, margin_atr=0.25,
+                            min_move_atr=0.0) -> List[ChannelSeg]:
+    """method F + robust trimmed band + extend-until-support-break + optional
+    trend-quality filter (min_move_atr)."""
     n = len(h)
     segs = []
     for lg in legs:
@@ -400,15 +431,86 @@ def method_piecewise_robust(legs, pivs, h, l, c, min_grade, atr_v,
                                                for x, y in zip(xs, ys))
             if m is not None and maxres > tol and (i - 1) - seg_start >= 2:
                 _emit_robust(segs, cp[seg_start:i - 1], lp, lg.direction,
-                             top_pct, c, n, atr_v, margin_atr)
+                             top_pct, c, n, atr_v, margin_atr, min_move_atr)
                 seg_start = i - 2
                 i = seg_start + 2
             else:
                 i += 1
         _emit_robust(segs, cp[seg_start:], lp, lg.direction, top_pct, c, n,
-                     atr_v, margin_atr)
+                     atr_v, margin_atr, min_move_atr)
     # Clean handoff: a channel stops where the next one starts (or earlier, at
     # its own support break). Prevents many channels all running to session end.
+    segs.sort(key=lambda s: s.x0)
+    for i in range(len(segs) - 1):
+        if segs[i + 1].x0 > segs[i].x0:
+            segs[i].x1 = min(segs[i].x1, segs[i + 1].x0)
+    return segs
+
+
+def _emit_lu(segs, seg_chain, leg_pivs, direction, c, n, atr_v,
+             margin_atr=0.25, min_move_atr=0.0):
+    """Mouli's construction: LOWER line fit to the lows, UPPER line fit to the
+    highs -- independently (the channel can be a wedge, not forced parallel).
+    seg_chain = the trend-side pivots that defined this segment (lows for UP)."""
+    if len(seg_chain) < 2:
+        return
+    x0 = seg_chain[0].idx
+    x1p = seg_chain[-1].idx
+    lows = [p for p in leg_pivs if x0 <= p.idx <= x1p and p.kind == -1]
+    highs = [p for p in leg_pivs if x0 <= p.idx <= x1p and p.kind == 1]
+    trend_m, _ = _regress([p.idx for p in seg_chain], [p.price for p in seg_chain])
+    if trend_m is None:
+        return
+    if min_move_atr > 0 and atr_v is not None and abs(trend_m * (x1p - x0)) < min_move_atr * atr_v[x1p]:
+        return
+    lo_m, lo_b = _regress([p.idx for p in lows], [p.price for p in lows]) if len(lows) >= 2 else (None, None)
+    hi_m, hi_b = _regress([p.idx for p in highs], [p.price for p in highs]) if len(highs) >= 2 else (None, None)
+    # If a side lacks 2 pivots, fall back to the trend slope offset to that side.
+    if lo_m is None:
+        base = lows or seg_chain
+        lo_m = trend_m; lo_b = min(p.price - lo_m * p.idx for p in base)
+    if hi_m is None:
+        base = highs or seg_chain
+        hi_m = trend_m; hi_b = max(p.price - hi_m * p.idx for p in base)
+    # Extend until price closes through the trend-side rail (UP: lower / DOWN: upper).
+    x1e = n - 1
+    for b in range(x1p + 1, n):
+        mgn = (atr_v[b] * margin_atr) if atr_v is not None else 0.0
+        if direction == 1 and c[b] < lo_m * b + lo_b - mgn:
+            x1e = b; break
+        if direction == 2 and c[b] > hi_m * b + hi_b + mgn:
+            x1e = b; break
+    segs.append(ChannelSeg(x0, x1e, lo_m, lo_b, hi_b, direction, hi_m))
+
+
+def method_lower_upper(legs, pivs, h, l, c, min_grade, atr_v,
+                       tol_atr=1.2, margin_atr=0.25, min_move_atr=0.0) -> List[ChannelSeg]:
+    """Lower line from lows, upper from highs (independent). Trend-side pivots
+    are segmented by slope change (piecewise fit-break); a new channel starts at
+    the slope-change pivot."""
+    n = len(h)
+    segs = []
+    for lg in legs:
+        chain_kind = -1 if lg.direction == 1 else 1
+        lp = [pivs[i] for i in lg.piv_idxs]
+        cp = [p for p in lp if p.kind == chain_kind]
+        if len(cp) < 2:
+            continue
+        seg_start = 0
+        i = 2
+        while i <= len(cp):
+            xs = [p.idx for p in cp[seg_start:i]]
+            ys = [p.price for p in cp[seg_start:i]]
+            m, b = _regress(xs, ys)
+            tol = atr_v[cp[i - 1].idx] * tol_atr if atr_v is not None else 1e9
+            maxres = 0.0 if m is None else max(abs(y - (m * x + b)) for x, y in zip(xs, ys))
+            if m is not None and maxres > tol and (i - 1) - seg_start >= 2:
+                _emit_lu(segs, cp[seg_start:i - 1], lp, lg.direction, c, n, atr_v, margin_atr, min_move_atr)
+                seg_start = i - 2
+                i = seg_start + 2
+            else:
+                i += 1
+        _emit_lu(segs, cp[seg_start:], lp, lg.direction, c, n, atr_v, margin_atr, min_move_atr)
     segs.sort(key=lambda s: s.x0)
     for i in range(len(segs) - 1):
         if segs[i + 1].x0 > segs[i].x0:
@@ -513,12 +615,13 @@ def _draw_candles(ax, o, h, l, c):
 def _draw_segs(ax, segs: List[ChannelSeg]):
     for s in segs:
         col = "#0aa" if s.direction == 1 else "#e69500"
-        for b, lw in ((s.sup_b, 1.6), (s.res_b, 1.6)):
-            y0 = s.slope * s.x0 + b
-            y1 = s.slope * s.x1 + b
-            ax.plot([s.x0, s.x1], [y0, y1], color=col, linewidth=lw, zorder=4)
-        cb = (s.sup_b + s.res_b) / 2.0
-        ax.plot([s.x0, s.x1], [s.slope * s.x0 + cb, s.slope * s.x1 + cb],
+        us = s.hi_slope if s.hi_slope is not None else s.slope   # upper-line slope
+        # lower line (slope, sup_b) and upper line (us, res_b) -- may be non-parallel
+        ylo0, ylo1 = s.slope * s.x0 + s.sup_b, s.slope * s.x1 + s.sup_b
+        yhi0, yhi1 = us * s.x0 + s.res_b, us * s.x1 + s.res_b
+        ax.plot([s.x0, s.x1], [ylo0, ylo1], color=col, linewidth=1.6, zorder=4)
+        ax.plot([s.x0, s.x1], [yhi0, yhi1], color=col, linewidth=1.6, zorder=4)
+        ax.plot([s.x0, s.x1], [(ylo0 + yhi0) / 2.0, (ylo1 + yhi1) / 2.0],
                 color=col, linewidth=0.7, linestyle=":", zorder=4)
 
 
@@ -575,11 +678,12 @@ def main():
     target = dt.date(2026, 5, 28)
     if len(sys.argv) > 1:
         target = dt.date.fromisoformat(sys.argv[1])
+    interval = sys.argv[2] if len(sys.argv) > 2 else "2m"
     out_dir = os.path.join(os.path.dirname(__file__), "out")
     os.makedirs(out_dir, exist_ok=True)
 
-    print("Fetching /ES 2m from Yahoo ...")
-    ts, o, h, l, c = fetch_es_2m()
+    print(f"Fetching /ES {interval} from Yahoo ...")
+    ts, o, h, l, c = fetch_es(interval)
     print(f"  total bars: {len(ts)}")
     ts, o, h, l, c = filter_session_wide(ts, o, h, l, c, target)
     print(f"  session bars for {target} (04:00-20:00 ET): {len(ts)}")
@@ -613,8 +717,12 @@ def main():
          method_spike_and_channel(legs, pivs, h, l, 3, atr_v, 0.75)),
         ("F_piecewise_regression tol1.2 (spike->grind split)",
          method_piecewise_regression(legs, pivs, h, l, 3, atr_v, 1.2)),
-        ("H_robust top85 + extend-until-support-break",
-         method_piecewise_robust(legs, pivs, h, l, c, 3, atr_v, 1.2, 85)),
+        ("J_parallel + trend-filter 2.5ATR",
+         method_piecewise_robust(legs, pivs, h, l, c, 3, atr_v, 1.2, 85, 0.25, 2.5)),
+        ("L_lower-from-lows_upper-from-highs (wedge) +filter2.5",
+         method_lower_upper(legs, pivs, h, l, c, 3, atr_v, 1.2, 0.25, 2.5)),
+        ("M_lower-upper no filter",
+         method_lower_upper(legs, pivs, h, l, c, 3, atr_v, 1.2, 0.25, 0.0)),
     ]
 
     for label, segs in methods:

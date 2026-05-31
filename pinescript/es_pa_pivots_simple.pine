@@ -51,6 +51,7 @@ show_major = input.bool(true, "Draw major-scale channels (cyan)", group="Major c
 major_min_grade = input.int(3, "Major: min pivot grade for channel touches (3=A, 2=B+)", minval=2, maxval=3, tooltip="Leg structure is always defined by Grade-A swings; this controls which pivots the channel regression rides. 3 (A only) matches the validated Python prototype -- cleaner. 2 (B+) adds more touch points if the channels look too sparse.", group="Major channels")
 major_break_atr = input.float(2.0, "Major: break threshold (xATR)", minval=0.25, maxval=8.0, step=0.25, tooltip="Higher = fewer, broader major legs. A major leg only reverses when a Grade-A pivot breaks its HL/LH chain by this many ATRs. Raise it if the trend keeps flipping UP/DOWN on pullbacks (opposite-color channels crossing).", group="Major channels")
 major_keep = input.int(24, "Major: keep only the last N channels", minval=1, maxval=200, tooltip="Caps how many finalized major channels stay on the chart, so they don't pile up infinitely across all loaded history. With ~6-8 clean channels per day, 24 keeps roughly the last 3 trading days. Raise it to see more history; lower it to declutter when zoomed in.", group="Major channels")
+major_min_move_atr = input.float(2.5, "Major: min trend move to draw a channel (xATR)", minval=0.0, maxval=15.0, step=0.5, tooltip="Trend-quality filter. A segment only draws a channel once its net directional travel (|slope x span|) reaches this many ATRs. Chop goes nowhere, so it stays blank -- the channel emerges progressively as a real trend develops. Raise it to suppress more chop / only show strong trends; 0 disables the filter.", group="Major channels")
 major_width = input.int(3, "Major: line width (px)", minval=1, maxval=6, group="Major channels")
 major_fit_atr = input.float(1.2, "Major: regression fit tolerance (xATR)", minval=0.25, maxval=5.0, step=0.1, tooltip="Piecewise regression (spike-and-channel). The major channel slope is the least-squares regression over the segment's support pivots, recomputed each pivot so it DEVELOPS as time progresses. When a new pivot makes that regression stop fitting -- max residual of the support pivots exceeds this many ATRs -- the segment is finalized and a fresh regression starts at the prior pivot (a genuine slope change like spike->grind). Larger = fewer, longer channels.", group="Major channels")
 major_break_margin_atr = input.float(0.25, "Major: clean-break margin (xATR)", minval=0.0, maxval=2.0, step=0.05, tooltip="A channel ends only when a bar CLOSES beyond its trend-side line (support for UP / resistance for DOWN) by at least this many ATRs -- a CLEAN break, not a marginal poke. Raise it if downtrends fragment into many short channels because normal bounces nick the resistance.", group="Major channels")
@@ -1079,7 +1080,15 @@ if not na(ph_a_val)
         if m_leg_dir != 0 and m_seg_start_idx >= 0
             ck = m_leg_dir == 1 ? -1 : 1
             [rm, rb, rcnt, rmx] = major_reg_fit(m_seg_start_idx, major_min_grade, ck)
-            if rcnt >= 2 and not na(rm)
+            // Trend-quality filter: only draw once the segment's net directional
+            // travel (|slope x span|) reaches major_min_move_atr*ATR. Below that
+            // it's chop -> stays blank; the channel emerges progressively as a
+            // real trend develops. (A chop segment that never draws also never
+            // registers, so it can't flood the keep-N buffer.)
+            seg_left_bar = array.get(piv_bars, m_seg_start_idx)
+            net_move = na(rm) ? 0.0 : math.abs(rm * (bar_index - seg_left_bar))
+            mv_thr = major_min_move_atr * (na(atr14) ? 0.0 : atr14)
+            if rcnt >= 2 and not na(rm) and net_move >= mv_thr
                 [mc, mp, mcen, mdb, mused] = update_current_channel(m_leg_dir, m_seg_start_idx, m_chain, m_par, m_cen, major_min_grade, true, rm)
                 m_chain := mc
                 m_par   := mp
@@ -1146,7 +1155,15 @@ if not na(pl_a_val)
         if m_leg_dir != 0 and m_seg_start_idx >= 0
             ck = m_leg_dir == 1 ? -1 : 1
             [rm, rb, rcnt, rmx] = major_reg_fit(m_seg_start_idx, major_min_grade, ck)
-            if rcnt >= 2 and not na(rm)
+            // Trend-quality filter: only draw once the segment's net directional
+            // travel (|slope x span|) reaches major_min_move_atr*ATR. Below that
+            // it's chop -> stays blank; the channel emerges progressively as a
+            // real trend develops. (A chop segment that never draws also never
+            // registers, so it can't flood the keep-N buffer.)
+            seg_left_bar = array.get(piv_bars, m_seg_start_idx)
+            net_move = na(rm) ? 0.0 : math.abs(rm * (bar_index - seg_left_bar))
+            mv_thr = major_min_move_atr * (na(atr14) ? 0.0 : atr14)
+            if rcnt >= 2 and not na(rm) and net_move >= mv_thr
                 [mc, mp, mcen, mdb, mused] = update_current_channel(m_leg_dir, m_seg_start_idx, m_chain, m_par, m_cen, major_min_grade, true, rm)
                 m_chain := mc
                 m_par   := mp
