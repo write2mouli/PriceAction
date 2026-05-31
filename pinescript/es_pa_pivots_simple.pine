@@ -501,16 +501,10 @@ if not na(ph_c_val)
     else if legs_inc == 1
         leg_start_pivot_idx := new_idx
         channel_epoch_start_idx := new_idx
-    // CHoCH (Change of Character): in DOWN leg, an HH (regardless of break
-    // size) breaks the LH chain -> new channel epoch starts.
-    if old_leg_dir_h == 2 and slab == "HH"
-        if not na(cur_leg_trendline)
-            line.delete(cur_leg_trendline)
-        if not na(cur_leg_parallel)
-            line.delete(cur_leg_parallel)
-        cur_leg_trendline := na
-        cur_leg_parallel := na
-        channel_epoch_start_idx := new_idx
+    // (Mid-leg CHoCH check removed: was firing on every minor LL/HH and
+    // resetting the epoch before 2 chain pivots could accumulate, so the
+    // channel never appeared. TRANSITION is the only epoch boundary now;
+    // it already requires a "significant break" via leg_break_atr.)
     // Draw this pivot's label
     lab = draw_label_for(bx, bp, 1, slab, 1, leg_state)
     array.push(piv_labs, lab)
@@ -565,15 +559,9 @@ if not na(pl_c_val)
     else if legs_inc == 1
         leg_start_pivot_idx := new_idx
         channel_epoch_start_idx := new_idx
-    // CHoCH: in UP leg, an LL (any size) breaks the HL chain -> new epoch
-    if old_leg_dir_l == 1 and slab == "LL"
-        if not na(cur_leg_trendline)
-            line.delete(cur_leg_trendline)
-        if not na(cur_leg_parallel)
-            line.delete(cur_leg_parallel)
-        cur_leg_trendline := na
-        cur_leg_parallel := na
-        channel_epoch_start_idx := new_idx
+    // (Mid-leg CHoCH check removed: was firing on every minor LL and
+    // resetting the epoch before 2 chain pivots could accumulate.
+    // TRANSITION already encodes "significant break" via leg_break_atr.)
     lab = draw_label_for(bx, bp, -1, slab, 1, leg_state)
     array.push(piv_labs, lab)
     if leg_dir != 0
