@@ -27,7 +27,7 @@ strength_a = input.int(5, "Grade A strength", minval=3, maxval=30, group="Pivot 
 
 show_grade_a = input.bool(true,  "Show Grade A (major)",  group="Display")
 show_grade_b = input.bool(true,  "Show Grade B (medium)", group="Display")
-show_grade_c = input.bool(false, "Show Grade C (minor)",  group="Display")
+show_grade_c = input.bool(true,  "Show Grade C (minor)",  group="Display")
 show_labels  = input.bool(true,  "Show HH/HL/LH/LL text labels", group="Display")
 show_ema     = input.bool(true,  "Show EMA21", group="Display")
 
@@ -59,10 +59,22 @@ var array<label>  piv_labs       = array.new<label>(0)
 // Structural & leg state globals --------------------------------------------
 var float last_h_price = na
 var float last_l_price = na
-var int   leg_dir         = 0    // 0=INIT, 1=UP, 2=DOWN
-var float leg_anchor      = na
-var float leg_extreme     = na
-var int   leg_extreme_idx = -1
+// Leg state machine (HL-chain for UP, LH-chain for DOWN).
+//   leg_dir       : 0=INIT, 1=UP, 2=DOWN
+//   last_hl_price : during UP leg, the most recent HL price (= current support
+//                   to defend; a new LL below this by `thr` breaks the leg)
+//   last_lh_price : during DOWN leg, the most recent LH price (= current
+//                   resistance; a new HH above this by `thr` breaks the leg)
+//   leg_extreme_h_idx : index in piv_* of the highest H in the current UP leg
+//                       (re-tagged BLACK when leg ends)
+//   leg_extreme_l_idx : same for lowest L in the current DOWN leg
+var int   leg_dir          = 0
+var float last_hl_price    = na
+var float last_lh_price    = na
+var int   leg_extreme_h_idx = -1
+var int   leg_extreme_l_idx = -1
+var float leg_extreme_h_price = na
+var float leg_extreme_l_price = na
 
 // Counters
 var int n_hh = 0
@@ -109,78 +121,134 @@ draw_label_for(bx, bp, kind, slab, grade, leg_state) =>
     else
         label.new(bx, bp, "", color=color.new(color.gray, 100), style=label.style_none, size=size.tiny)
 
-// Pure compute: leg state transition given current state.
-// Returns [out_state, new_dir, new_anchor, new_extreme, new_extreme_idx,
+// Pure compute: leg state transition using HL-chain (UP) / LH-chain (DOWN).
+// Mouli's rule: HL is the primary uptrend signal, LH is the primary downtrend
+// signal. HHs/LLs are secondary extensions.
+//
+// Returns [out_state, new_dir, new_last_hl, new_last_lh, new_extreme_h_idx,
+//          new_extreme_l_idx, new_extreme_h_price, new_extreme_l_price,
 //          legs_inc, retro_black_idx]
-//   legs_inc = 1 if this pivot starts a new leg (so we increment counter), 0 otherwise
-//   retro_black_idx = pivot array index whose label should be re-drawn as
-//                     TRANSITION (the prior leg's extreme), or -1 if none
-compute_leg_state(price, kind, pivot_idx, cur_dir, cur_anchor, cur_extreme, cur_extreme_idx, thr) =>
+//
+// out_state values:
+//   EXTEND_UP   -- pivot confirms or extends the current UP leg (HL or HH)
+//   EXTEND_DN   -- pivot confirms or extends the current DOWN leg (LH or LL)
+//   IN_RANGE    -- counter-trend warning (LH in UP, HL in DOWN, or weak break)
+//   TRANSITION  -- definitive break of HL/LH chain; ends current leg
+//   INIT        -- direction not yet established
+compute_leg_state(price, kind, slab, pivot_idx, cur_dir, cur_last_hl, cur_last_lh, cur_extreme_h_idx, cur_extreme_l_idx, cur_extreme_h_price, cur_extreme_l_price, thr) =>
     out_state = "INIT"
     new_dir = cur_dir
-    new_anchor = cur_anchor
-    new_extreme = cur_extreme
-    new_extreme_idx = cur_extreme_idx
+    new_last_hl = cur_last_hl
+    new_last_lh = cur_last_lh
+    new_extreme_h_idx = cur_extreme_h_idx
+    new_extreme_l_idx = cur_extreme_l_idx
+    new_extreme_h_price = cur_extreme_h_price
+    new_extreme_l_price = cur_extreme_l_price
     legs_inc = 0
     retro_black_idx = -1
     if cur_dir == 0
-        if na(cur_anchor)
-            new_anchor := price
+        // INIT: wait for first HL (-> UP leg) or LL (-> DOWN leg)
+        if kind == -1 and slab == "HL"
+            new_dir := 1
+            new_last_hl := price
+            new_extreme_h_price := -1.0e10
+            new_extreme_l_price := price
+            new_extreme_l_idx := pivot_idx
+            out_state := "EXTEND_UP"
+            legs_inc := 1
+        else if kind == -1 and slab == "LL"
+            new_dir := 2
+            new_extreme_l_price := price
+            new_extreme_l_idx := pivot_idx
+            out_state := "EXTEND_DN"
+            legs_inc := 1
+        else if kind == 1 and slab == "HH"
+            // HH first -- ambiguous, but lean UP since price extended
+            new_dir := 1
+            new_extreme_h_price := price
+            new_extreme_h_idx := pivot_idx
+            out_state := "EXTEND_UP"
+            legs_inc := 1
+        else if kind == 1 and slab == "LH"
+            new_dir := 2
+            new_last_lh := price
+            new_extreme_h_price := price
+            new_extreme_h_idx := pivot_idx
+            out_state := "EXTEND_DN"
+            legs_inc := 1
+        else
             out_state := "INIT"
-        else
-            if price > cur_anchor + thr
-                new_dir := 1
-                new_extreme := price
-                new_extreme_idx := pivot_idx
-                out_state := "EXTEND_UP"
-                legs_inc := 1
-            else if price < cur_anchor - thr
-                new_dir := 2
-                new_extreme := price
-                new_extreme_idx := pivot_idx
-                out_state := "EXTEND_DN"
-                legs_inc := 1
-            else
-                out_state := "IN_RANGE"
     else if cur_dir == 1
-        if kind == 1
-            if price > cur_extreme
-                new_extreme := price
-                new_extreme_idx := pivot_idx
-                out_state := "EXTEND_UP"
-            else
-                out_state := "IN_RANGE"
-        else
-            if price > cur_anchor - thr
-                out_state := "IN_RANGE"
-            else
-                out_state := "TRANSITION"
-                retro_black_idx := cur_extreme_idx
-                new_dir := 2
-                new_anchor := cur_extreme
-                new_extreme := price
-                new_extreme_idx := pivot_idx
-                legs_inc := 1
-    else if cur_dir == 2
+        // UP leg: track HL chain on lows; HHs extend secondarily.
         if kind == -1
-            if price < cur_extreme
-                new_extreme := price
-                new_extreme_idx := pivot_idx
-                out_state := "EXTEND_DN"
+            if slab == "HL"
+                // Continues HL chain -- this IS the uptrend signal
+                new_last_hl := price
+                out_state := "EXTEND_UP"
+                if price < cur_extreme_l_price or na(cur_extreme_l_price)
+                    new_extreme_l_price := price
+                    new_extreme_l_idx := pivot_idx
             else
-                out_state := "IN_RANGE"
+                // LL in UP leg
+                if na(cur_last_hl) or price >= cur_last_hl - thr
+                    // Didn't break the HL chain decisively
+                    out_state := "IN_RANGE"
+                else
+                    // Decisive break of HL support -> TRANSITION to DOWN
+                    out_state := "TRANSITION"
+                    retro_black_idx := cur_extreme_h_idx
+                    new_dir := 2
+                    new_last_hl := na
+                    new_last_lh := na
+                    new_extreme_h_idx := -1
+                    new_extreme_h_price := na
+                    new_extreme_l_idx := pivot_idx
+                    new_extreme_l_price := price
+                    legs_inc := 1
         else
-            if price < cur_anchor + thr
-                out_state := "IN_RANGE"
+            // HIGH pivot in UP leg
+            if slab == "HH"
+                // Extends the uptrend (secondary signal)
+                out_state := "EXTEND_UP"
+                if price > cur_extreme_h_price or na(cur_extreme_h_price)
+                    new_extreme_h_price := price
+                    new_extreme_h_idx := pivot_idx
             else
-                out_state := "TRANSITION"
-                retro_black_idx := cur_extreme_idx
-                new_dir := 1
-                new_anchor := cur_extreme
-                new_extreme := price
-                new_extreme_idx := pivot_idx
-                legs_inc := 1
-    [out_state, new_dir, new_anchor, new_extreme, new_extreme_idx, legs_inc, retro_black_idx]
+                // LH in UP leg -- failed continuation warning
+                out_state := "IN_RANGE"
+    else if cur_dir == 2
+        // DOWN leg: track LH chain on highs; LLs extend secondarily.
+        if kind == 1
+            if slab == "LH"
+                new_last_lh := price
+                out_state := "EXTEND_DN"
+                if price > cur_extreme_h_price or na(cur_extreme_h_price)
+                    new_extreme_h_price := price
+                    new_extreme_h_idx := pivot_idx
+            else
+                // HH in DOWN leg
+                if na(cur_last_lh) or price <= cur_last_lh + thr
+                    out_state := "IN_RANGE"
+                else
+                    out_state := "TRANSITION"
+                    retro_black_idx := cur_extreme_l_idx
+                    new_dir := 1
+                    new_last_hl := na
+                    new_last_lh := na
+                    new_extreme_l_idx := -1
+                    new_extreme_l_price := na
+                    new_extreme_h_idx := pivot_idx
+                    new_extreme_h_price := price
+                    legs_inc := 1
+        else
+            if slab == "LL"
+                out_state := "EXTEND_DN"
+                if price < cur_extreme_l_price or na(cur_extreme_l_price)
+                    new_extreme_l_price := price
+                    new_extreme_l_idx := pivot_idx
+            else
+                out_state := "IN_RANGE"
+    [out_state, new_dir, new_last_hl, new_last_lh, new_extreme_h_idx, new_extreme_l_idx, new_extreme_h_price, new_extreme_l_price, legs_inc, retro_black_idx]
 
 // Array-only helper: find the latest pivot of (bar, kind) and upgrade its
 // grade label. Returns [old_grade, found_idx]; counters updated at caller.
@@ -252,12 +320,15 @@ if not na(ph_c_val)
     array.push(piv_grades, 1)
     array.push(piv_slabs, slab)
     new_idx = array.size(piv_bars) - 1
-    // Leg state compute
-    [leg_state, new_dir, new_anchor, new_extreme, new_extreme_idx, legs_inc, retro_idx] = compute_leg_state(bp, 1, new_idx, leg_dir, leg_anchor, leg_extreme, leg_extreme_idx, thr)
+    // Leg state compute (HL/LH chain)
+    [leg_state, new_dir, new_last_hl, new_last_lh, new_eh_idx, new_el_idx, new_eh_price, new_el_price, legs_inc, retro_idx] = compute_leg_state(bp, 1, slab, new_idx, leg_dir, last_hl_price, last_lh_price, leg_extreme_h_idx, leg_extreme_l_idx, leg_extreme_h_price, leg_extreme_l_price, thr)
     leg_dir := new_dir
-    leg_anchor := new_anchor
-    leg_extreme := new_extreme
-    leg_extreme_idx := new_extreme_idx
+    last_hl_price := new_last_hl
+    last_lh_price := new_last_lh
+    leg_extreme_h_idx := new_eh_idx
+    leg_extreme_l_idx := new_el_idx
+    leg_extreme_h_price := new_eh_price
+    leg_extreme_l_price := new_el_price
     n_legs := n_legs + legs_inc
     array.push(piv_leg_states, leg_state)
     if retro_idx >= 0
@@ -285,11 +356,14 @@ if not na(pl_c_val)
     array.push(piv_grades, 1)
     array.push(piv_slabs, slab)
     new_idx = array.size(piv_bars) - 1
-    [leg_state, new_dir, new_anchor, new_extreme, new_extreme_idx, legs_inc, retro_idx] = compute_leg_state(bp, -1, new_idx, leg_dir, leg_anchor, leg_extreme, leg_extreme_idx, thr)
+    [leg_state, new_dir, new_last_hl, new_last_lh, new_eh_idx, new_el_idx, new_eh_price, new_el_price, legs_inc, retro_idx] = compute_leg_state(bp, -1, slab, new_idx, leg_dir, last_hl_price, last_lh_price, leg_extreme_h_idx, leg_extreme_l_idx, leg_extreme_h_price, leg_extreme_l_price, thr)
     leg_dir := new_dir
-    leg_anchor := new_anchor
-    leg_extreme := new_extreme
-    leg_extreme_idx := new_extreme_idx
+    last_hl_price := new_last_hl
+    last_lh_price := new_last_lh
+    leg_extreme_h_idx := new_eh_idx
+    leg_extreme_l_idx := new_el_idx
+    leg_extreme_h_price := new_eh_price
+    leg_extreme_l_price := new_el_price
     n_legs := n_legs + legs_inc
     array.push(piv_leg_states, leg_state)
     if retro_idx >= 0
