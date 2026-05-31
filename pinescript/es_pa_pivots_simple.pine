@@ -48,9 +48,11 @@ broad_min_run = input.int(3, "Range merge: consecutive small legs to merge", min
 // fragment it. The result is a handful of big trend channels overlaid on the
 // minor green/red ones -- the steep impulse and the broad grind each as ONE.
 show_major = input.bool(true, "Draw major-scale channels (cyan)", group="Major channels")
-major_min_grade = input.int(2, "Major: min pivot grade for channel touches (3=A, 2=B+)", minval=2, maxval=3, tooltip="Leg structure is always defined by Grade-A swings; this controls which pivots the channel edges ride. 2 (B+) gives more touch points; 3 (A only) is cleaner but may touch only 2 pivots.", group="Major channels")
+major_min_grade = input.int(3, "Major: min pivot grade for channel touches (3=A, 2=B+)", minval=2, maxval=3, tooltip="Leg structure is always defined by Grade-A swings; this controls which pivots the channel regression rides. 3 (A only) matches the validated Python prototype -- cleaner. 2 (B+) adds more touch points if the channels look too sparse.", group="Major channels")
 major_break_atr = input.float(1.5, "Major: break threshold (xATR)", minval=0.25, maxval=5.0, step=0.25, tooltip="Higher = fewer, broader major legs. A major leg only reverses when a Grade-A pivot breaks its HL/LH chain by this many ATRs. Raise it if the midday grind splits into several channels instead of one.", group="Major channels")
 major_width = input.int(3, "Major: line width (px)", minval=1, maxval=6, group="Major channels")
+major_fit_atr = input.float(1.2, "Major: regression fit tolerance (xATR)", minval=0.25, maxval=5.0, step=0.1, tooltip="Piecewise regression (spike-and-channel). The major channel slope is the least-squares regression over the segment's support pivots, recomputed each pivot so it DEVELOPS as time progresses. When a new pivot makes that regression stop fitting -- max residual of the support pivots exceeds this many ATRs -- the segment is finalized and a fresh regression starts at the prior pivot (a genuine slope change like spike->grind). Larger = fewer, longer channels.", group="Major channels")
+major_break_margin_atr = input.float(0.25, "Major: clean-break margin (xATR)", minval=0.0, maxval=2.0, step=0.05, tooltip="A channel ends only when a bar CLOSES beyond its trend-side line (support for UP / resistance for DOWN) by at least this many ATRs -- a CLEAN break, not a marginal poke. Raise it if downtrends fragment into many short channels because normal bounces nick the resistance.", group="Major channels")
 
 // EMA + ATR ------------------------------------------------------------------
 atr14 = ta.atr(14)
@@ -123,10 +125,14 @@ var int   m_eh_idx    = -1
 var int   m_el_idx    = -1
 var float m_eh_price  = na
 var float m_el_price  = na
-var int   m_epoch_start_idx = -1
 var line  m_chain = na
 var line  m_par   = na
 var line  m_cen   = na
+// Piecewise regression: the current channel SEGMENT (one regression phase within
+// the leg). Its slope is the regression over the segment's support pivots,
+// recomputed each pivot. When that regression stops fitting, the segment is
+// finalized and a new one starts at the prior pivot.
+var int   m_seg_start_idx = -1
 
 // Counters
 var int n_hh = 0
@@ -605,11 +611,17 @@ retag_label(idx, new_leg_state) =>
 //            (min_grade=1) uses every pivot.
 // maj:       true -> cyan/orange thick lines drawn under show_major; false ->
 //            green/red thin lines under show_channels.
-update_current_channel(leg_direction, leg_start_idx, cur_chain, cur_par, cur_cen, min_grade, maj) =>
+// in_locked_slope: if not na, the slope is FORCED to this (spike-and-channel
+//            segments lock their slope from the first 2 pivots so it doesn't
+//            drift). If na, the hull slope is computed. The slope actually used
+//            is returned so the caller can lock it after the first valid draw.
+// Returns [new_chain, new_parallel, new_center, n_chain_found, used_slope]
+update_current_channel(leg_direction, leg_start_idx, cur_chain, cur_par, cur_cen, min_grade, maj, float in_locked_slope) =>
     new_chain = cur_chain
     new_par   = cur_par
     new_cen   = cur_cen
     dbg_n_chain = 0
+    float used_slope = na
     if (maj ? show_major : show_channels)
         if leg_start_idx >= 0
             chain_kind = leg_direction == 1 ? -1 : 1   // lows for UP, highs for DOWN
@@ -648,24 +660,48 @@ update_current_channel(leg_direction, leg_start_idx, cur_chain, cur_par, cur_cen
                             else
                                 hull_slope := math.max(hull_slope, s)
             dbg_n_chain := cn
-            // Need the anchor + >=1 more chain pivot to define the line.
-            if not na(hull_slope) and cn >= 1
-                slope = hull_slope
+            // Locked slope (segment) overrides the hull; otherwise use the hull.
+            // Draw if we have a slope from either source.
+            slope = na(in_locked_slope) ? hull_slope : in_locked_slope
+            if not na(slope)
+                used_slope := slope
                 // Pass 2: widen to envelop EVERY pivot (both kinds). With the hull
                 // slope, the min residual equals the anchor AND binding-pivot
                 // residual, so the trend-side edge passes through 2+ pivots
                 // (clean touches); the opposite edge rides the extreme excursion.
-                float r_max = -1.0e18
-                float r_min =  1.0e18
+                // Track the top-2 and bottom-2 residuals so the MAJOR layer can
+                // drop a single overshoot on the non-trend side (an 'overshoot
+                // anomaly' should poke OUT, not widen the channel) -- the
+                // trend-side edge stays exact so support still touches the lows.
+                float rmax1 = -1.0e18
+                float rmax2 = -1.0e18
+                float rmin1 =  1.0e18
+                float rmin2 =  1.0e18
+                int   nenv  = 0
                 for i = leg_start_idx to n - 1
                     if array.get(piv_grades, i) >= min_grade
                         rb = array.get(piv_bars, i)
                         rp = array.get(piv_prices, i)
                         resid = rp - slope * rb
-                        if resid > r_max
-                            r_max := resid
-                        if resid < r_min
-                            r_min := resid
+                        nenv := nenv + 1
+                        if resid > rmax1
+                            rmax2 := rmax1
+                            rmax1 := resid
+                        else if resid > rmax2
+                            rmax2 := resid
+                        if resid < rmin1
+                            rmin2 := rmin1
+                            rmin1 := resid
+                        else if resid < rmin2
+                            rmin2 := resid
+                trim = maj and nenv >= 4
+                float r_max = (trim and rmax2 > -1.0e17) ? rmax2 : rmax1
+                float r_min = (trim and rmin2 <  1.0e17) ? rmin2 : rmin1
+                // Keep the trend-defining edge exact (touch the lows/highs).
+                if maj and leg_direction == 1
+                    r_min := rmin1
+                if maj and leg_direction == 2
+                    r_max := rmax1
                 left_x  = array.get(piv_bars, leg_start_idx)
                 right_x = bar_index
                 up_yL = slope * left_x  + r_max
@@ -695,7 +731,52 @@ update_current_channel(leg_direction, leg_start_idx, cur_chain, cur_par, cur_cen
                     new_chain := line.new(left_x, up_yL, right_x, up_yR, color=c, width=lw, extend=ext)
                     new_par   := line.new(left_x, lo_yL, right_x, lo_yR, color=c, width=lw, extend=ext)
                 new_cen := line.new(left_x, cen_yL, right_x, cen_yR, color=color.new(c, 35), width=1, style=line.style_dotted, extend=ext)
-    [new_chain, new_par, new_cen, dbg_n_chain]
+    [new_chain, new_par, new_cen, dbg_n_chain, used_slope]
+
+// Least-squares regression over the segment's CHAIN-side pivots (lows for UP /
+// highs for DOWN) at grade >= min_grade, from seg_start_idx to the latest pivot.
+// Also returns the MAX residual of those pivots from the fitted line -- the
+// "does this regression still fit?" measure used to split a spike from a channel.
+// Returns [slope, intercept, count, max_residual].
+major_reg_fit(seg_start_idx, min_grade, chain_kind) =>
+    n = array.size(piv_bars)
+    int   cnt = 0
+    float sx  = 0.0
+    float sy  = 0.0
+    float sxy = 0.0
+    float sxx = 0.0
+    if seg_start_idx >= 0
+        for i = seg_start_idx to n - 1
+            if array.get(piv_kinds, i) == chain_kind and array.get(piv_grades, i) >= min_grade
+                b = array.get(piv_bars, i)
+                p = array.get(piv_prices, i)
+                cnt := cnt + 1
+                sx  := sx + b
+                sy  := sy + p
+                sxy := sxy + b * p
+                sxx := sxx + b * b
+    float slope = na
+    float intercept = na
+    float maxres = 0.0
+    den = cnt * sxx - sx * sx
+    if cnt >= 2 and den != 0
+        slope := (cnt * sxy - sx * sy) / den
+        intercept := (sy - slope * sx) / cnt
+        for i = seg_start_idx to n - 1
+            if array.get(piv_kinds, i) == chain_kind and array.get(piv_grades, i) >= min_grade
+                r = math.abs(array.get(piv_prices, i) - (slope * array.get(piv_bars, i) + intercept))
+                maxres := math.max(maxres, r)
+    [slope, intercept, cnt, maxres]
+
+// Index of the last chain-side pivot (grade >= min_grade) strictly BEFORE
+// before_idx within the segment -- the new segment's start when a fit breaks.
+major_prev_chain(seg_start_idx, min_grade, chain_kind, before_idx) =>
+    res = -1
+    if seg_start_idx >= 0 and before_idx > seg_start_idx
+        for i = seg_start_idx to before_idx - 1
+            if array.get(piv_kinds, i) == chain_kind and array.get(piv_grades, i) >= min_grade
+                res := i
+    res
 
 // === Process detections this bar ===========================================
 thr = na(atr14) ? 0.0 : atr14 * leg_break_atr
@@ -773,7 +854,7 @@ if not na(ph_c_val)
     array.push(piv_labs, lab)
     // Adaptive channel update for the current epoch
     if leg_dir != 0
-        [new_tl, new_pl, new_cn, dbg_n] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel, cur_leg_center, 1, false)
+        [new_tl, new_pl, new_cn, dbg_n, _mus] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel, cur_leg_center, 1, false, na)
         cur_leg_trendline := new_tl
         cur_leg_parallel := new_pl
         cur_leg_center := new_cn
@@ -838,7 +919,7 @@ if not na(pl_c_val)
     lab = draw_label_for(bx, bp, -1, slab, 1, leg_state)
     array.push(piv_labs, lab)
     if leg_dir != 0
-        [new_tl, new_pl, new_cn, dbg_n] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel, cur_leg_center, 1, false)
+        [new_tl, new_pl, new_cn, dbg_n, _mus] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel, cur_leg_center, 1, false, na)
         cur_leg_trendline := new_tl
         cur_leg_parallel := new_pl
         cur_leg_center := new_cn
@@ -918,22 +999,45 @@ if not na(ph_a_val)
         m_eh_price := m_nehp
         m_el_price := m_nelp
         if m_retro >= 0
-            // Major transition: finalize (clip + keep) the prior major channel,
-            // start a fresh one anchored at the CHoCH pivot (prior leg extreme).
+            // Major CHoCH reversal: finalize the live segment, start a fresh
+            // leg + segment anchored at the CHoCH pivot (prior leg extreme).
             finalize_channel(m_chain, bar_index)
             finalize_channel(m_par, bar_index)
             finalize_channel(m_cen, bar_index)
             m_chain := na
             m_par   := na
             m_cen   := na
-            m_epoch_start_idx := m_retro
+            m_seg_start_idx := m_retro
         else if m_inc == 1
-            m_epoch_start_idx := found_idx
-        if m_leg_dir != 0
-            [mc, mp, mcen, mdb] = update_current_channel(m_leg_dir, m_epoch_start_idx, m_chain, m_par, m_cen, major_min_grade, true)
-            m_chain := mc
-            m_par   := mp
-            m_cen   := mcen
+            m_seg_start_idx := found_idx
+        else if m_seg_start_idx < 0 and m_leg_dir != 0
+            // Restart a segment after a clean close-below-support break finalized
+            // the prior channel (m_seg_start_idx was set to -1 there).
+            m_seg_start_idx := found_idx
+        // Piecewise-regression fit-break: this HIGH is a chain pivot only in a
+        // DOWN leg. When the segment's regression no longer fits the chain highs
+        // (max residual > tol), finalize and restart at the prior chain pivot --
+        // a real slope change (spike -> channel), not a wiggle.
+        if m_leg_dir == 2 and m_seg_start_idx >= 0
+            [fm, fb, fcnt, fmax] = major_reg_fit(m_seg_start_idx, major_min_grade, 1)
+            if fcnt >= 3 and fmax > major_fit_atr * (na(atr14) ? 0.0 : atr14)
+                pc = major_prev_chain(m_seg_start_idx, major_min_grade, 1, found_idx)
+                finalize_channel(m_chain, bar_index)
+                finalize_channel(m_par, bar_index)
+                finalize_channel(m_cen, bar_index)
+                m_chain := na
+                m_par   := na
+                m_cen   := na
+                m_seg_start_idx := pc >= 0 ? pc : m_seg_start_idx
+        // Redraw the live segment with its developing regression slope.
+        if m_leg_dir != 0 and m_seg_start_idx >= 0
+            ck = m_leg_dir == 1 ? -1 : 1
+            [rm, rb, rcnt, rmx] = major_reg_fit(m_seg_start_idx, major_min_grade, ck)
+            if rcnt >= 2 and not na(rm)
+                [mc, mp, mcen, mdb, mused] = update_current_channel(m_leg_dir, m_seg_start_idx, m_chain, m_par, m_cen, major_min_grade, true, rm)
+                m_chain := mc
+                m_par   := mp
+                m_cen   := mcen
 if not na(pl_a_val)
     [old_g, found_idx, old_sl, new_sl] = upgrade_pivot_grade(bar_index - strength_a, -1, 3)
     if found_idx >= 0
@@ -973,14 +1077,57 @@ if not na(pl_a_val)
             m_chain := na
             m_par   := na
             m_cen   := na
-            m_epoch_start_idx := m_retro
+            m_seg_start_idx := m_retro
         else if m_inc == 1
-            m_epoch_start_idx := found_idx
-        if m_leg_dir != 0
-            [mc, mp, mcen, mdb] = update_current_channel(m_leg_dir, m_epoch_start_idx, m_chain, m_par, m_cen, major_min_grade, true)
-            m_chain := mc
-            m_par   := mp
-            m_cen   := mcen
+            m_seg_start_idx := found_idx
+        else if m_seg_start_idx < 0 and m_leg_dir != 0
+            m_seg_start_idx := found_idx
+        // Piecewise-regression fit-break (this LOW is a chain pivot only in an
+        // UP leg). Finalize + restart at the prior chain low when the segment's
+        // support regression stops fitting the chain lows.
+        if m_leg_dir == 1 and m_seg_start_idx >= 0
+            [fm, fb, fcnt, fmax] = major_reg_fit(m_seg_start_idx, major_min_grade, -1)
+            if fcnt >= 3 and fmax > major_fit_atr * (na(atr14) ? 0.0 : atr14)
+                pc = major_prev_chain(m_seg_start_idx, major_min_grade, -1, found_idx)
+                finalize_channel(m_chain, bar_index)
+                finalize_channel(m_par, bar_index)
+                finalize_channel(m_cen, bar_index)
+                m_chain := na
+                m_par   := na
+                m_cen   := na
+                m_seg_start_idx := pc >= 0 ? pc : m_seg_start_idx
+        // Redraw the live segment with its developing regression slope.
+        if m_leg_dir != 0 and m_seg_start_idx >= 0
+            ck = m_leg_dir == 1 ? -1 : 1
+            [rm, rb, rcnt, rmx] = major_reg_fit(m_seg_start_idx, major_min_grade, ck)
+            if rcnt >= 2 and not na(rm)
+                [mc, mp, mcen, mdb, mused] = update_current_channel(m_leg_dir, m_seg_start_idx, m_chain, m_par, m_cen, major_min_grade, true, rm)
+                m_chain := mc
+                m_par   := mp
+                m_cen   := mcen
+
+// Major channel termination (every bar): a channel extends to the right until
+// price CLOSES beyond its trend-side line -- UP: close < support / DOWN: close >
+// resistance. That clean break finalizes the channel here (not at the next
+// pivot); the segment then restarts at the next major pivot. m_chain is the
+// support line for UP / resistance line for DOWN (see update_current_channel).
+if show_major and not na(m_chain) and m_leg_dir != 0
+    cx1 = line.get_x1(m_chain)
+    cy1 = line.get_y1(m_chain)
+    cx2 = line.get_x2(m_chain)
+    cy2 = line.get_y2(m_chain)
+    csl = cx2 != cx1 ? (cy2 - cy1) / (cx2 - cx1) : 0.0
+    trend_y_now = cy1 + csl * (bar_index - cx1)
+    mgn = major_break_margin_atr * (na(atr14) ? 0.0 : atr14)
+    broke = m_leg_dir == 1 ? close < trend_y_now - mgn : close > trend_y_now + mgn
+    if broke
+        finalize_channel(m_chain, bar_index)
+        finalize_channel(m_par, bar_index)
+        finalize_channel(m_cen, bar_index)
+        m_chain := na
+        m_par   := na
+        m_cen   := na
+        m_seg_start_idx := -1
 
 // Status table ---------------------------------------------------------------
 var table tbl = table.new(position.top_right, 2, 13, bgcolor=color.new(color.gray, 80), border_width=1)
