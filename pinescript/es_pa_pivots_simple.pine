@@ -25,13 +25,14 @@ strength_c = input.int(1, "Grade C strength (bars each side)", minval=1, maxval=
 strength_b = input.int(3, "Grade B strength", minval=2, maxval=20, group="Pivot grades")
 strength_a = input.int(5, "Grade A strength", minval=3, maxval=30, group="Pivot grades")
 
+show_pivots  = input.bool(false, "Show pivot markers", group="Display")
 show_grade_a = input.bool(true,  "Show Grade A (major)",  group="Display")
 show_grade_b = input.bool(true,  "Show Grade B (medium)", group="Display")
 show_grade_c = input.bool(true,  "Show Grade C (minor)",  group="Display")
-show_labels  = input.bool(true,  "Show HH/HL/LH/LL text labels", group="Display")
+show_labels  = input.bool(false, "Show HH/HL/LH/LL text labels", group="Display")
 show_ema     = input.bool(true,  "Show EMA21", group="Display")
 
-leg_break_atr = input.float(0.5, "Leg break threshold (xATR)", minval=0.0, maxval=3.0, step=0.05, group="Legs")
+leg_break_atr = input.float(0.75, "Leg break threshold (xATR)", minval=0.0, maxval=3.0, step=0.05, tooltip="Raised from 0.5: minor wiggles inside a range no longer spawn micro-legs.", group="Legs")
 use_leg_color = input.bool(true, "Color pivots by leg state (instead of HH/HL/LH/LL)", group="Legs")
 
 show_channels  = input.bool(true, "Draw parallel channel per leg", group="Channels")
@@ -39,6 +40,17 @@ channel_min_pivots = input.int(2, "Min HL/LH pivots to start drawing", minval=2,
 channel_extend = input.bool(true, "Extend channel lines to the right", group="Channels")
 channel_touch_atr = input.float(0.4, "Touch tolerance (xATR)", minval=0.05, maxval=2.0, step=0.05, tooltip="A pivot counts as a touch of the parallel if it's within this distance of the line. Used for the solid-channel test.", group="Channels")
 channel_solid_extreme_touches = input.int(1, "Solid: min extreme-side touches", minval=1, maxval=5, tooltip="Channel becomes 'solid' (thicker lines) when there are this many HH/LL pivots near the parallel.", group="Channels")
+broad_small_atr = input.float(2.0, "Range merge: max channel height (xATR) for a 'slim' leg", minval=0.5, maxval=10.0, step=0.25, tooltip="A finalized channel whose height (chain-to-parallel distance) is <= this many ATRs counts as a slim/range leg. Trading-range legs are thin in PRICE even when wide in time, so we measure amplitude, not bar count.", group="Channels")
+broad_min_run = input.int(3, "Range merge: consecutive small legs to merge", minval=2, maxval=10, tooltip="When this many small legs occur back-to-back (a trading range), their slim channels are replaced by ONE broad parallel band.", group="Channels")
+
+// Major-scale channel layer (cyan). A SECOND leg machine fed only Grade-A
+// (major-swing) pivots with a larger break threshold, so minor wiggles don't
+// fragment it. The result is a handful of big trend channels overlaid on the
+// minor green/red ones -- the steep impulse and the broad grind each as ONE.
+show_major = input.bool(true, "Draw major-scale channels (cyan)", group="Major channels")
+major_min_grade = input.int(2, "Major: min pivot grade for channel touches (3=A, 2=B+)", minval=2, maxval=3, tooltip="Leg structure is always defined by Grade-A swings; this controls which pivots the channel edges ride. 2 (B+) gives more touch points; 3 (A only) is cleaner but may touch only 2 pivots.", group="Major channels")
+major_break_atr = input.float(1.5, "Major: break threshold (xATR)", minval=0.25, maxval=5.0, step=0.25, tooltip="Higher = fewer, broader major legs. A major leg only reverses when a Grade-A pivot breaks its HL/LH chain by this many ATRs. Raise it if the midday grind splits into several channels instead of one.", group="Major channels")
+major_width = input.int(3, "Major: line width (px)", minval=1, maxval=6, group="Major channels")
 
 // EMA + ATR ------------------------------------------------------------------
 atr14 = ta.atr(14)
@@ -90,14 +102,31 @@ var int   leg_start_pivot_idx = -1
 // the prior epoch's lines are DELETED and new lines start fresh. Old
 // channels don't accumulate on the chart -- only the active channel for
 // the current epoch is shown.
-var line  cur_leg_trendline = na    // chain line (HLs for UP, LHs for DOWN)
-var line  cur_leg_parallel  = na    // parallel through current extreme
+var line  cur_leg_trendline = na    // chain line: support (UP, rides LLâ†’HLs) / resistance (DOWN, rides HHâ†’LHs)
+var line  cur_leg_parallel  = na    // opposite parallel through first opposite-side pivot
+var line  cur_leg_center    = na    // center / median line midway between the two
 
 // Channel epoch start = pivot index where the CURRENT channel began.
 // Resets on CHoCH (Mouli: "as soon as character changes -- HL breached
 // and LL formed") or TRANSITION (full leg reversal). The epoch may start
 // mid-leg if the HL chain breaks even by a small amount.
 var int   channel_epoch_start_idx = -1
+
+// --- Major-scale leg machine state (mirror of the minor one, fed only Grade-A
+// pivots through the same pure compute_leg_state). Independent so the two
+// scales never interfere. m_chain/m_par/m_cen are the LIVE major channel; on a
+// major transition they're finalized (clipped + kept) and new lines start.
+var int   m_leg_dir   = 0
+var float m_last_hl   = na
+var float m_last_lh   = na
+var int   m_eh_idx    = -1
+var int   m_el_idx    = -1
+var float m_eh_price  = na
+var float m_el_price  = na
+var int   m_epoch_start_idx = -1
+var line  m_chain = na
+var line  m_par   = na
+var line  m_cen   = na
 
 // Counters
 var int n_hh = 0
@@ -140,7 +169,7 @@ text_style_for_kind(kind) =>
 // Create a label (no global state mutation; just returns the label ref)
 draw_label_for(bx, bp, kind, slab, grade, leg_state) =>
     c = use_leg_color ? color_for_leg_state(leg_state) : color_for_slab(slab)
-    if show_for_grade(grade)
+    if show_pivots and show_for_grade(grade)
         sz = size_for_grade(grade)
         style = text_style_for_kind(kind)
         txt = show_labels ? slab : ""
@@ -336,6 +365,204 @@ upgrade_pivot_grade(bx, kind, new_grade) =>
                 array.set(piv_labs, found, new_lab)
     [old_grade, found, old_slab, new_slab]
 
+// Finalize a completed leg's channel line: clip its right edge to clip_x
+// (the transition bar) and stop it extending to the right. This keeps the
+// channel ON the chart as a bounded parallelogram over the leg's lifespan
+// -- matching how Mouli hand-draws one channel per leg -- instead of
+// deleting it (which left the chart with at most one live channel, often
+// none at the right edge) or letting it project forward forever (clutter).
+// Line setters don't mutate script globals, so this is fine inside a fn.
+finalize_channel(ln, clip_x) =>
+    if not na(ln)
+        x1 = line.get_x1(ln)
+        y1 = line.get_y1(ln)
+        x2 = line.get_x2(ln)
+        y2 = line.get_y2(ln)
+        if x2 != x1
+            sl = (y2 - y1) / (x2 - x1)
+            line.set_xy2(ln, clip_x, y1 + sl * (clip_x - x1))
+        line.set_extend(ln, extend.none)
+
+// Registry of finalized (completed) channels, used to dedup overlaps. We keep
+// the three line refs plus each channel's bar range [xa, xb].
+var array<line> fin_chain = array.new<line>(0)
+var array<line> fin_par   = array.new<line>(0)
+var array<line> fin_cen   = array.new<line>(0)
+var array<int>  fin_xa    = array.new<int>(0)
+var array<int>  fin_xb    = array.new<int>(0)
+
+// Broad trading-range channel state. When several small legs occur back to
+// back (a range), their slim channels are suppressed and replaced by ONE broad
+// parallel band drawn with draw_broad. The run buffer holds the slim line refs
+// so they can be deleted once the run is confirmed.
+var array<line> run_chain   = array.new<line>(0)
+var array<line> run_par     = array.new<line>(0)
+var array<line> run_cen     = array.new<line>(0)
+var int  run_count          = 0
+var int  run_start_idx      = -1
+var line broad_chain        = na
+var line broad_par          = na
+var line broad_cen          = na
+
+// Draw a broad parallel band over pivots [s_idx, e_idx]: one regression slope
+// over ALL pivots, top line offset through the highest high, bottom through the
+// lowest low, center between. Distinct purple color flags it as a range.
+draw_broad(s_idx, e_idx, right_x) =>
+    line bc = na
+    line bp = na
+    line bn = na
+    if s_idx >= 0 and e_idx >= s_idx and e_idx < array.size(piv_bars)
+        int   cnt = 0
+        float sx  = 0.0
+        float sy  = 0.0
+        float sxy = 0.0
+        float sxx = 0.0
+        float hi_p = -1.0e18
+        float lo_p =  1.0e18
+        int   hi_bar = 0
+        int   lo_bar = 0
+        for i = s_idx to e_idx
+            b = array.get(piv_bars, i)
+            p = array.get(piv_prices, i)
+            cnt := cnt + 1
+            sx  := sx + b
+            sy  := sy + p
+            sxy := sxy + b * p
+            sxx := sxx + b * b
+            if p > hi_p
+                hi_p := p
+                hi_bar := b
+            if p < lo_p
+                lo_p := p
+                lo_bar := b
+        den = cnt * sxx - sx * sx
+        if cnt >= 3
+            slope = den != 0 ? (cnt * sxy - sx * sy) / den : 0.0
+            x_left = array.get(piv_bars, s_idx)
+            top_b = hi_p - slope * hi_bar
+            bot_b = lo_p - slope * lo_bar
+            top_yL = top_b + slope * x_left
+            top_yR = top_b + slope * right_x
+            bot_yL = bot_b + slope * x_left
+            bot_yR = bot_b + slope * right_x
+            cen_yL = (top_yL + bot_yL) / 2.0
+            cen_yR = (top_yR + bot_yR) / 2.0
+            colb = color.purple
+            // A broad band marks a COMPLETED trading range, so it must NOT
+            // project to the right -- that produced the "channel extending even
+            // after the break" overlap. It always spans only [range start ..
+            // last slim transition] and is redrawn longer as the range extends.
+            bc := line.new(x_left, top_yL, right_x, top_yR, color=colb, width=2, extend=extend.none)
+            bp := line.new(x_left, bot_yL, right_x, bot_yR, color=colb, width=2, extend=extend.none)
+            bn := line.new(x_left, cen_yL, right_x, cen_yR, color=color.new(colb, 35), width=1, style=line.style_dotted, extend=extend.none)
+    [bc, bp, bn]
+
+// Engulf-dedup a finalized (large) channel against existing finalized channels.
+// Conservative: when one channel's bar range is fully CONTAINED in another whose
+// span is >= 2x larger, keep only the bigger one. Abutting/partial overlaps are
+// both kept, so this never collapses the whole chart -- only nested duplicates.
+dedup_register(chain, par, cen) =>
+    if not na(chain)
+        nxa = line.get_x1(chain)
+        nxb = line.get_x2(chain)
+        nspan = math.max(1, nxb - nxa)
+        keep_new = true
+        i = 0
+        while i < array.size(fin_xa)
+            exa = array.get(fin_xa, i)
+            exb = array.get(fin_xb, i)
+            espan = math.max(1, exb - exa)
+            new_engulfs = nxa <= exa and nxb >= exb and espan * 2 <= nspan
+            old_engulfs = exa <= nxa and exb >= nxb and nspan * 2 <= espan
+            if new_engulfs
+                line.delete(array.get(fin_chain, i))
+                line.delete(array.get(fin_par, i))
+                line.delete(array.get(fin_cen, i))
+                array.remove(fin_chain, i)
+                array.remove(fin_par, i)
+                array.remove(fin_cen, i)
+                array.remove(fin_xa, i)
+                array.remove(fin_xb, i)
+            else
+                if old_engulfs
+                    keep_new := false
+                i := i + 1
+        if keep_new
+            array.push(fin_chain, chain)
+            array.push(fin_par, par)
+            array.push(fin_cen, cen)
+            array.push(fin_xa, nxa)
+            array.push(fin_xb, nxb)
+        else
+            line.delete(chain)
+            line.delete(par)
+            line.delete(cen)
+
+// Finalize a just-completed channel. Small legs are buffered into a run; once
+// broad_min_run consecutive small legs accumulate (a range), their slim lines
+// are deleted and one broad band is drawn. A large leg ends any run and is
+// engulf-deduped normally.
+// Pine v5 forbids `:=` on globals inside a function, so the run-state scalars
+// and broad-line refs are passed in and the NEW values returned for the caller
+// to assign at top level. The run_* and fin_* arrays are mutated in place
+// (array.push/clear/remove are allowed inside functions).
+register_finalized(chain, par, cen, clip_x, s_idx, e_idx, in_rc, in_rsi, in_bch, in_bp, in_bn) =>
+    finalize_channel(chain, clip_x)
+    finalize_channel(par, clip_x)
+    finalize_channel(cen, clip_x)
+    int  o_rc  = in_rc
+    int  o_rsi = in_rsi
+    line o_bch = in_bch
+    line o_bp  = in_bp
+    line o_bn  = in_bn
+    if not na(chain) and not na(par)
+        // "Slim" = small AMPLITUDE, not few bars. A trading-range leg is thin in
+        // price (chain line and its parallel sit close together) yet can span
+        // many bars of sideways chop. Measuring channel height in ATRs catches
+        // those range legs; a bar-count test missed them (they're wide in time).
+        // get_y1 is the anchor y on each line; finalize_channel only moved x2/y2,
+        // so the anchor distance is still the channel's height.
+        ch_height = math.abs(line.get_y1(chain) - line.get_y1(par))
+        atrv = na(atr14) ? 0.0 : atr14
+        is_small = atrv > 0 and ch_height <= broad_small_atr * atrv
+        if is_small
+            if o_rc == 0
+                o_rsi := s_idx
+            o_rc := o_rc + 1
+            array.push(run_chain, chain)
+            array.push(run_par, par)
+            array.push(run_cen, cen)
+            if o_rc >= broad_min_run
+                // Confirmed range: drop every slim line we are holding and
+                // (re)draw the broad band over the whole run so far.
+                for k = 0 to array.size(run_chain) - 1
+                    line.delete(array.get(run_chain, k))
+                    line.delete(array.get(run_par, k))
+                    line.delete(array.get(run_cen, k))
+                array.clear(run_chain)
+                array.clear(run_par)
+                array.clear(run_cen)
+                line.delete(o_bch)
+                line.delete(o_bp)
+                line.delete(o_bn)
+                [bc, bp2, bn2] = draw_broad(o_rsi, e_idx, clip_x)
+                o_bch := bc
+                o_bp  := bp2
+                o_bn  := bn2
+        else
+            // Large leg ends any open run. Leave the broad band (if any) on the
+            // chart, drop our refs, reset the run, and dedup this big channel.
+            o_rc  := 0
+            o_rsi := -1
+            array.clear(run_chain)
+            array.clear(run_par)
+            array.clear(run_cen)
+            o_bch := na
+            o_bp  := na
+            o_bn  := na
+            dedup_register(chain, par, cen)
+    [o_rc, o_rsi, o_bch, o_bp, o_bn]
+
 // Array-only helper: re-draw a pivot's label with a forced leg_state
 // (used for the retroactive TRANSITION marking on prior leg extreme).
 retag_label(idx, new_leg_state) =>
@@ -352,107 +579,123 @@ retag_label(idx, new_leg_state) =>
             array.set(piv_labs, idx, new_lab)
             array.set(piv_leg_states, idx, new_leg_state)
 
-// Adaptive channel update for the CURRENT leg. Called after every new
+// Adaptive 3-line channel update for the CURRENT leg. Called after every new
 // pivot in an active leg. Pure compute -- doesn't mutate globals; caller
 // re-assigns the returned line refs.
 //
-// Slope is LOCKED from the first two chain pivots (HLs for UP, LHs for DOWN)
-// so the channel doesn't drift as later pivots come in. The parallel
-// shifts vertically to pass through the leg's current extreme (highest H
-// for UP, lowest L for DOWN).
+// Construction (inclusive regression channel, redrawn as the leg develops):
+//   1. TILT: least-squares regression slope over the trend-defining (chain-side)
+//      pivots -- HLs for UP, LHs for DOWN. These are the pivots Mouli's eye
+//      connects, so the channel rides the trend rather than going near-vertical.
+//   2. ENVELOPE: offset two parallel boundaries to the max/min residual of EVERY
+//      pivot (highs and lows) from that regression line. The band therefore
+//      contains all the swing pivots. When price exits in the SAME direction at a
+//      future pivot, that pivot becomes the new extreme residual and the band
+//      simply gets broader -- the channel stays inclusive instead of being
+//      escaped. Wicks between pivots and rare anomalies may still poke out; ok.
+//   3. The chain line is the trend-defining boundary (support/lows for UP,
+//      resistance/highs for DOWN); the parallel is the opposite envelope; the
+//      center is their midline.
 //
-// Touch counting: chain pivots are inherent touches of the trendline.
-// For the parallel, we count extreme-kind pivots whose price is within
-// channel_touch_atr * ATR of the line. When the chain has >= 2 anchors
-// AND the parallel has >= channel_solid_extreme_touches, the channel
-// is drawn at width 2 (solid look); otherwise width 1 (tentative).
+// Recomputed every pivot, so the slope and width adapt "as time moves forward."
 //
-// Returns [new_trendline, new_parallel, n_chain_found, second_chain_idx]
-// -- caller assigns to globals + can read diagnostics.
-update_current_channel(leg_direction, leg_start_idx, cur_lower, cur_upper) =>
-    new_lower = cur_lower
-    new_upper = cur_upper
+// Returns [new_chain, new_parallel, new_center, n_chain_found]
+// min_grade: only pivots of this grade or higher define the hull/envelope, so
+//            the MAJOR layer (min_grade>=2) rides major swings, the minor layer
+//            (min_grade=1) uses every pivot.
+// maj:       true -> cyan/orange thick lines drawn under show_major; false ->
+//            green/red thin lines under show_channels.
+update_current_channel(leg_direction, leg_start_idx, cur_chain, cur_par, cur_cen, min_grade, maj) =>
+    new_chain = cur_chain
+    new_par   = cur_par
+    new_cen   = cur_cen
     dbg_n_chain = 0
-    dbg_second_chain = -1
-    if show_channels
+    if (maj ? show_major : show_channels)
         if leg_start_idx >= 0
-            target_slab = leg_direction == 1 ? "HL" : "LH"
-            target_kind = leg_direction == 1 ? -1 : 1
-            extreme_kind = leg_direction == 1 ? 1 : -1
-            first_chain = -1
-            second_chain = -1
-            last_chain = -1
-            n_chain = 0
-            extreme_idx = -1
-            float extreme_price = leg_direction == 1 ? -1.0e10 : 1.0e10
+            chain_kind = leg_direction == 1 ? -1 : 1   // lows for UP, highs for DOWN
             n = array.size(piv_bars)
+            // Pass 1: a SUPPORT/RESISTANCE trendline the pivots actually sit ON,
+            // so a channel break is unambiguous. Anchor at the leftmost chain-side
+            // pivot, then take the slope to the "binding" later pivot: the MIN
+            // slope for UP (no low ends up below the line) or MAX slope for DOWN
+            // (no high above it). That's the lower (UP) / upper (DOWN) hull through
+            // 2+ pivots -- the edge TOUCHES the lows/highs rather than floating off
+            // them the way a regression-offset line did. (A regression average put
+            // only the single deepest low on the line.)
+            anchor_idx = -1
             for i = leg_start_idx to n - 1
-                cand_kind = array.get(piv_kinds, i)
-                cand_slab = array.get(piv_slabs, i)
-                cand_price = array.get(piv_prices, i)
-                if cand_kind == target_kind
-                    if cand_slab == target_slab
-                        if first_chain < 0
-                            first_chain := i
-                        else if second_chain < 0
-                            second_chain := i
-                        last_chain := i
-                        n_chain := n_chain + 1
-                if cand_kind == extreme_kind
-                    if leg_direction == 1
-                        if cand_price > extreme_price
-                            extreme_price := cand_price
-                            extreme_idx := i
-                    else
-                        if cand_price < extreme_price
-                            extreme_price := cand_price
-                            extreme_idx := i
-            dbg_n_chain := n_chain
-            dbg_second_chain := second_chain
-            if n_chain >= channel_min_pivots
-                if second_chain >= 0
-                    // Slope locked from first two chain pivots
-                    x1 = array.get(piv_bars, first_chain)
-                    y1 = array.get(piv_prices, first_chain)
-                    x2 = array.get(piv_bars, second_chain)
-                    y2 = array.get(piv_prices, second_chain)
-                    slope = (y2 - y1) / (x2 - x1)
-                    // Trendline extends from first chain pivot to current bar
-                    right_x = bar_index
-                    right_y_trend = y1 + slope * (right_x - x1)
-                    // Count parallel touches
-                    n_extreme_touches = 0
-                    touch_thr = na(atr14) ? 0.0 : atr14 * channel_touch_atr
-                    if extreme_idx >= 0
-                        ex_x = array.get(piv_bars, extreme_idx)
-                        ex_y = array.get(piv_prices, extreme_idx)
-                        for j = leg_start_idx to n - 1
-                            cand_kind_j = array.get(piv_kinds, j)
-                            if cand_kind_j == extreme_kind
-                                cand_x_j = array.get(piv_bars, j)
-                                cand_p_j = array.get(piv_prices, j)
-                                line_y = ex_y + slope * (cand_x_j - ex_x)
-                                if math.abs(cand_p_j - line_y) <= touch_thr
-                                    n_extreme_touches := n_extreme_touches + 1
-                    is_solid = n_chain >= 2 and n_extreme_touches >= channel_solid_extreme_touches
-                    line_w = is_solid ? 2 : 1
-                    c = leg_direction == 1 ? color.green : color.red
-                    ext = channel_extend ? extend.right : extend.none
-                    // Delete prior live lines (if any)
-                    if not na(cur_lower)
-                        line.delete(cur_lower)
-                    if not na(cur_upper)
-                        line.delete(cur_upper)
-                    // Trendline
-                    new_lower := line.new(x1, y1, right_x, right_y_trend, color=c, width=line_w, extend=ext)
-                    // Parallel through extreme
-                    if extreme_idx >= 0
-                        ex_x = array.get(piv_bars, extreme_idx)
-                        ex_y = array.get(piv_prices, extreme_idx)
-                        y1p = ex_y + slope * (x1 - ex_x)
-                        y2p = ex_y + slope * (right_x - ex_x)
-                        new_upper := line.new(x1, y1p, right_x, y2p, color=c, width=line_w, style=line.style_dashed, extend=ext)
-    [new_lower, new_upper, dbg_n_chain, dbg_second_chain]
+                if array.get(piv_kinds, i) == chain_kind and array.get(piv_grades, i) >= min_grade
+                    if anchor_idx < 0
+                        anchor_idx := i
+            float hull_slope = na
+            int   cn = 0
+            // Guard anchor_idx < n-1 so the slope loop never runs descending
+            // (Pine `for a to b` with a>b counts DOWN -> out-of-bounds get).
+            if anchor_idx >= 0 and anchor_idx < n - 1
+                x0 = array.get(piv_bars, anchor_idx)
+                y0 = array.get(piv_prices, anchor_idx)
+                for i = anchor_idx + 1 to n - 1
+                    if array.get(piv_kinds, i) == chain_kind and array.get(piv_grades, i) >= min_grade
+                        xi = array.get(piv_bars, i)
+                        yi = array.get(piv_prices, i)
+                        if xi != x0
+                            s = (yi - y0) / (xi - x0)
+                            cn := cn + 1
+                            if na(hull_slope)
+                                hull_slope := s
+                            else if leg_direction == 1
+                                hull_slope := math.min(hull_slope, s)
+                            else
+                                hull_slope := math.max(hull_slope, s)
+            dbg_n_chain := cn
+            // Need the anchor + >=1 more chain pivot to define the line.
+            if not na(hull_slope) and cn >= 1
+                slope = hull_slope
+                // Pass 2: widen to envelop EVERY pivot (both kinds). With the hull
+                // slope, the min residual equals the anchor AND binding-pivot
+                // residual, so the trend-side edge passes through 2+ pivots
+                // (clean touches); the opposite edge rides the extreme excursion.
+                float r_max = -1.0e18
+                float r_min =  1.0e18
+                for i = leg_start_idx to n - 1
+                    if array.get(piv_grades, i) >= min_grade
+                        rb = array.get(piv_bars, i)
+                        rp = array.get(piv_prices, i)
+                        resid = rp - slope * rb
+                        if resid > r_max
+                            r_max := resid
+                        if resid < r_min
+                            r_min := resid
+                left_x  = array.get(piv_bars, leg_start_idx)
+                right_x = bar_index
+                up_yL = slope * left_x  + r_max
+                up_yR = slope * right_x + r_max
+                lo_yL = slope * left_x  + r_min
+                lo_yR = slope * right_x + r_min
+                cen_yL = (up_yL + lo_yL) / 2.0
+                cen_yR = (up_yR + lo_yR) / 2.0
+                // Major layer: cyan (UP) / orange (DOWN), thicker so the two big
+                // trend channels stand out over the minor green/red ones.
+                c = maj ? (leg_direction == 1 ? color.aqua : color.orange) : (leg_direction == 1 ? color.green : color.red)
+                lw = maj ? major_width : 1
+                ext = channel_extend ? extend.right : extend.none
+                // Delete prior live lines (avoid within-epoch accumulation)
+                if not na(cur_chain)
+                    line.delete(cur_chain)
+                if not na(cur_par)
+                    line.delete(cur_par)
+                if not na(cur_cen)
+                    line.delete(cur_cen)
+                // chain = trend-defining edge (lows for UP / highs for DOWN);
+                // par = opposite envelope. Both solid, center dotted.
+                if leg_direction == 1
+                    new_chain := line.new(left_x, lo_yL, right_x, lo_yR, color=c, width=lw, extend=ext)
+                    new_par   := line.new(left_x, up_yL, right_x, up_yR, color=c, width=lw, extend=ext)
+                else
+                    new_chain := line.new(left_x, up_yL, right_x, up_yR, color=c, width=lw, extend=ext)
+                    new_par   := line.new(left_x, lo_yL, right_x, lo_yR, color=c, width=lw, extend=ext)
+                new_cen := line.new(left_x, cen_yL, right_x, cen_yR, color=color.new(c, 35), width=1, style=line.style_dotted, extend=ext)
+    [new_chain, new_par, new_cen, dbg_n_chain]
 
 // === Process detections this bar ===========================================
 thr = na(atr14) ? 0.0 : atr14 * leg_break_atr
@@ -498,15 +741,26 @@ if not na(ph_c_val)
     array.push(piv_leg_states, leg_state)
     if retro_idx >= 0
         retag_label(retro_idx, "TRANSITION")
-        // Terminate the prior epoch's channel (delete -- no clutter accumulation)
-        if not na(cur_leg_trendline)
-            line.delete(cur_leg_trendline)
-        if not na(cur_leg_parallel)
-            line.delete(cur_leg_parallel)
+        // Finalize the prior epoch's channel: clip it to this bar and leave
+        // it on the chart (bounded). Then null the refs so the new epoch
+        // starts fresh lines. (Deleting here was why "no channels" showed --
+        // it removed the only completed channel each transition.)
+        [new_rc, new_rsi, new_bch, new_bp, new_bn] = register_finalized(cur_leg_trendline, cur_leg_parallel, cur_leg_center, bar_index, channel_epoch_start_idx, new_idx, run_count, run_start_idx, broad_chain, broad_par, broad_cen)
+        run_count := new_rc
+        run_start_idx := new_rsi
+        broad_chain := new_bch
+        broad_par := new_bp
+        broad_cen := new_bn
         cur_leg_trendline := na
         cur_leg_parallel := na
+        cur_leg_center := na
         leg_start_pivot_idx := new_idx
-        channel_epoch_start_idx := new_idx
+        // Backtrack the new channel to the pivot that INITIATED the CHoCH:
+        // the prior leg's extreme (the BLACK swing high/low = retro_idx).
+        // Scanning from there catches the first LH (new DOWN) / first HL
+        // (new UP) that signaled the character change, so the channel
+        // anchors at the reversal point instead of the later break pivot.
+        channel_epoch_start_idx := retro_idx >= 0 ? retro_idx : new_idx
     else if legs_inc == 1
         leg_start_pivot_idx := new_idx
         channel_epoch_start_idx := new_idx
@@ -519,9 +773,10 @@ if not na(ph_c_val)
     array.push(piv_labs, lab)
     // Adaptive channel update for the current epoch
     if leg_dir != 0
-        [new_tl, new_pl, dbg_n, dbg_sc] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel)
+        [new_tl, new_pl, new_cn, dbg_n] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel, cur_leg_center, 1, false)
         cur_leg_trendline := new_tl
         cur_leg_parallel := new_pl
+        cur_leg_center := new_cn
         last_n_chain := dbg_n
         if not na(new_tl)
             n_channel_draws := n_channel_draws + 1
@@ -560,14 +815,20 @@ if not na(pl_c_val)
     array.push(piv_leg_states, leg_state)
     if retro_idx >= 0
         retag_label(retro_idx, "TRANSITION")
-        if not na(cur_leg_trendline)
-            line.delete(cur_leg_trendline)
-        if not na(cur_leg_parallel)
-            line.delete(cur_leg_parallel)
+        // Finalize (clip + keep on chart) instead of deleting -- see the high
+        // block above for the rationale.
+        [new_rc, new_rsi, new_bch, new_bp, new_bn] = register_finalized(cur_leg_trendline, cur_leg_parallel, cur_leg_center, bar_index, channel_epoch_start_idx, new_idx, run_count, run_start_idx, broad_chain, broad_par, broad_cen)
+        run_count := new_rc
+        run_start_idx := new_rsi
+        broad_chain := new_bch
+        broad_par := new_bp
+        broad_cen := new_bn
         cur_leg_trendline := na
         cur_leg_parallel := na
+        cur_leg_center := na
         leg_start_pivot_idx := new_idx
-        channel_epoch_start_idx := new_idx
+        // Backtrack to the CHoCH-initiating pivot (prior leg's BLACK extreme).
+        channel_epoch_start_idx := retro_idx >= 0 ? retro_idx : new_idx
     else if legs_inc == 1
         leg_start_pivot_idx := new_idx
         channel_epoch_start_idx := new_idx
@@ -577,9 +838,10 @@ if not na(pl_c_val)
     lab = draw_label_for(bx, bp, -1, slab, 1, leg_state)
     array.push(piv_labs, lab)
     if leg_dir != 0
-        [new_tl, new_pl, dbg_n, dbg_sc] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel)
+        [new_tl, new_pl, new_cn, dbg_n] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel, cur_leg_center, 1, false)
         cur_leg_trendline := new_tl
         cur_leg_parallel := new_pl
+        cur_leg_center := new_cn
         last_n_chain := dbg_n
         if not na(new_tl)
             n_channel_draws := n_channel_draws + 1
@@ -641,6 +903,37 @@ if not na(ph_a_val)
                 n_hh := n_hh + 1
             else if new_sl == "LH"
                 n_lh := n_lh + 1
+    // ---- MAJOR leg machine: feed this freshly-confirmed Grade-A HIGH ----
+    if found_idx >= 0 and old_g < 3
+        m_price = array.get(piv_prices, found_idx)
+        m_ref = find_prev_significant_price(found_idx, 1, 3)
+        m_slab = na(m_ref) ? "?" : (m_price > m_ref ? "HH" : "LH")
+        m_thr = na(atr14) ? 0.0 : atr14 * major_break_atr
+        [m_st, m_nd, m_nhl, m_nlh, m_neh, m_nel, m_nehp, m_nelp, m_inc, m_retro] = compute_leg_state(m_price, 1, m_slab, found_idx, m_leg_dir, m_last_hl, m_last_lh, m_eh_idx, m_el_idx, m_eh_price, m_el_price, m_thr)
+        m_leg_dir  := m_nd
+        m_last_hl  := m_nhl
+        m_last_lh  := m_nlh
+        m_eh_idx   := m_neh
+        m_el_idx   := m_nel
+        m_eh_price := m_nehp
+        m_el_price := m_nelp
+        if m_retro >= 0
+            // Major transition: finalize (clip + keep) the prior major channel,
+            // start a fresh one anchored at the CHoCH pivot (prior leg extreme).
+            finalize_channel(m_chain, bar_index)
+            finalize_channel(m_par, bar_index)
+            finalize_channel(m_cen, bar_index)
+            m_chain := na
+            m_par   := na
+            m_cen   := na
+            m_epoch_start_idx := m_retro
+        else if m_inc == 1
+            m_epoch_start_idx := found_idx
+        if m_leg_dir != 0
+            [mc, mp, mcen, mdb] = update_current_channel(m_leg_dir, m_epoch_start_idx, m_chain, m_par, m_cen, major_min_grade, true)
+            m_chain := mc
+            m_par   := mp
+            m_cen   := mcen
 if not na(pl_a_val)
     [old_g, found_idx, old_sl, new_sl] = upgrade_pivot_grade(bar_index - strength_a, -1, 3)
     if found_idx >= 0
@@ -659,9 +952,38 @@ if not na(pl_a_val)
                 n_hl := n_hl + 1
             else if new_sl == "LL"
                 n_ll := n_ll + 1
+    // ---- MAJOR leg machine: feed this freshly-confirmed Grade-A LOW ----
+    if found_idx >= 0 and old_g < 3
+        m_price = array.get(piv_prices, found_idx)
+        m_ref = find_prev_significant_price(found_idx, -1, 3)
+        m_slab = na(m_ref) ? "?" : (m_price < m_ref ? "LL" : "HL")
+        m_thr = na(atr14) ? 0.0 : atr14 * major_break_atr
+        [m_st, m_nd, m_nhl, m_nlh, m_neh, m_nel, m_nehp, m_nelp, m_inc, m_retro] = compute_leg_state(m_price, -1, m_slab, found_idx, m_leg_dir, m_last_hl, m_last_lh, m_eh_idx, m_el_idx, m_eh_price, m_el_price, m_thr)
+        m_leg_dir  := m_nd
+        m_last_hl  := m_nhl
+        m_last_lh  := m_nlh
+        m_eh_idx   := m_neh
+        m_el_idx   := m_nel
+        m_eh_price := m_nehp
+        m_el_price := m_nelp
+        if m_retro >= 0
+            finalize_channel(m_chain, bar_index)
+            finalize_channel(m_par, bar_index)
+            finalize_channel(m_cen, bar_index)
+            m_chain := na
+            m_par   := na
+            m_cen   := na
+            m_epoch_start_idx := m_retro
+        else if m_inc == 1
+            m_epoch_start_idx := found_idx
+        if m_leg_dir != 0
+            [mc, mp, mcen, mdb] = update_current_channel(m_leg_dir, m_epoch_start_idx, m_chain, m_par, m_cen, major_min_grade, true)
+            m_chain := mc
+            m_par   := mp
+            m_cen   := mcen
 
 // Status table ---------------------------------------------------------------
-var table tbl = table.new(position.top_right, 2, 12, bgcolor=color.new(color.gray, 80), border_width=1)
+var table tbl = table.new(position.top_right, 2, 13, bgcolor=color.new(color.gray, 80), border_width=1)
 if barstate.islast
     leg_dir_s = leg_dir == 0 ? "INIT" : leg_dir == 1 ? "UP" : "DOWN"
     table.cell(tbl, 0, 0, "Leg dir", text_color=color.black, text_size=size.normal)
@@ -688,3 +1010,6 @@ if barstate.islast
     table.cell(tbl, 1, 10, str.tostring(n_ll), text_color=color.black, text_size=size.small)
     table.cell(tbl, 0, 11, "?",  text_color=color.gray, text_size=size.small)
     table.cell(tbl, 1, 11, str.tostring(n_q),  text_color=color.black, text_size=size.small)
+    m_dir_s = m_leg_dir == 0 ? "INIT" : m_leg_dir == 1 ? "UP" : "DOWN"
+    table.cell(tbl, 0, 12, "Major dir", text_color=color.teal, text_size=size.small)
+    table.cell(tbl, 1, 12, m_dir_s, text_color=color.teal, text_size=size.small)
