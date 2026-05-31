@@ -35,8 +35,10 @@ leg_break_atr = input.float(0.5, "Leg break threshold (xATR)", minval=0.0, maxva
 use_leg_color = input.bool(true, "Color pivots by leg state (instead of HH/HL/LH/LL)", group="Legs")
 
 show_channels  = input.bool(true, "Draw parallel channel per leg", group="Channels")
-channel_min_pivots = input.int(2, "Min HL/LH pivots needed to draw channel", minval=2, maxval=10, tooltip="Need at least this many HLs (UP) or LHs (DOWN) of any grade in the leg before a channel is drawn.", group="Channels")
+channel_min_pivots = input.int(2, "Min HL/LH pivots to start drawing", minval=2, maxval=10, tooltip="Need at least this many HLs (UP) or LHs (DOWN) before the channel appears. 2 = draw as soon as the slope can be defined.", group="Channels")
 channel_extend = input.bool(true, "Extend channel lines to the right", group="Channels")
+channel_touch_atr = input.float(0.4, "Touch tolerance (xATR)", minval=0.05, maxval=2.0, step=0.05, tooltip="A pivot counts as a touch of the parallel if it's within this distance of the line. Used for the solid-channel test.", group="Channels")
+channel_solid_extreme_touches = input.int(1, "Solid: min extreme-side touches", minval=1, maxval=5, tooltip="Channel becomes 'solid' (thicker lines) when there are this many HH/LL pivots near the parallel.", group="Channels")
 
 // EMA + ATR ------------------------------------------------------------------
 atr14 = ta.atr(14)
@@ -81,12 +83,14 @@ var float leg_extreme_h_price = na
 var float leg_extreme_l_price = na
 
 // Index in piv_* arrays of the pivot that started the CURRENT leg.
-// On TRANSITION, we use this to know the leg's span [start, extreme] for
-// channel drawing, then advance it to the new leg's first pivot.
 var int   leg_start_pivot_idx = -1
 
-// All channel lines we've drawn (so we could prune older ones if needed).
-var array<line> channel_lines = array.new<line>(0)
+// Adaptive channel: lines being LIVE-updated during the current leg.
+// On TRANSITION the refs are set to na (orphaned), so the lines remain on
+// the chart as the historical channel for the leg that just ended and new
+// leg starts with fresh channel lines.
+var line  cur_leg_trendline = na    // chain line (HLs for UP, LHs for DOWN)
+var line  cur_leg_parallel  = na    // parallel through current extreme
 
 // Counters
 var int n_hh = 0
@@ -337,46 +341,102 @@ retag_label(idx, new_leg_state) =>
             array.set(piv_labs, idx, new_lab)
             array.set(piv_leg_states, idx, new_leg_state)
 
-// Draw a parallel channel for the leg spanning piv_* indices
-// [start_idx, extreme_idx]. Direction: 1 = UP leg, 2 = DOWN leg.
-// Trendline goes through the chain pivots (HLs for UP, LHs for DOWN);
-// parallel is offset through the leg's extreme (highest H for UP,
-// lowest L for DOWN).
-draw_channel_for_leg(start_idx, extreme_idx, leg_direction) =>
+// Adaptive channel update for the CURRENT leg. Called after every new
+// pivot in an active leg. Pure compute -- doesn't mutate globals; caller
+// re-assigns the returned line refs.
+//
+// Slope is LOCKED from the first two chain pivots (HLs for UP, LHs for DOWN)
+// so the channel doesn't drift as later pivots come in. The parallel
+// shifts vertically to pass through the leg's current extreme (highest H
+// for UP, lowest L for DOWN).
+//
+// Touch counting: chain pivots are inherent touches of the trendline.
+// For the parallel, we count extreme-kind pivots whose price is within
+// channel_touch_atr * ATR of the line. When the chain has >= 2 anchors
+// AND the parallel has >= channel_solid_extreme_touches, the channel
+// is drawn at width 2 (solid look); otherwise width 1 (tentative).
+//
+// Returns [new_trendline, new_parallel] -- caller assigns to globals.
+update_current_channel(leg_direction, leg_start_idx, cur_lower, cur_upper) =>
+    new_lower = cur_lower
+    new_upper = cur_upper
     if show_channels
-        if start_idx >= 0
-            if extreme_idx >= start_idx
-                target_slab = leg_direction == 1 ? "HL" : "LH"
-                target_kind = leg_direction == 1 ? -1 : 1
-                first_match = -1
-                last_match = -1
-                n_chain = 0
-                for i = start_idx to extreme_idx
-                    cand_kind = array.get(piv_kinds, i)
-                    cand_slab = array.get(piv_slabs, i)
-                    if cand_kind == target_kind
-                        if cand_slab == target_slab
-                            if first_match < 0
-                                first_match := i
-                            last_match := i
-                            n_chain := n_chain + 1
-                if n_chain >= channel_min_pivots
-                    if last_match > first_match
-                        x1 = array.get(piv_bars, first_match)
-                        y1 = array.get(piv_prices, first_match)
-                        x2 = array.get(piv_bars, last_match)
-                        y2 = array.get(piv_prices, last_match)
-                        c = leg_direction == 1 ? color.green : color.red
-                        ext = channel_extend ? extend.right : extend.none
-                        tl = line.new(x1, y1, x2, y2, color=c, width=1, extend=ext)
-                        array.push(channel_lines, tl)
-                        slope = (y2 - y1) / (x2 - x1)
+        if leg_start_idx >= 0
+            target_slab = leg_direction == 1 ? "HL" : "LH"
+            target_kind = leg_direction == 1 ? -1 : 1
+            extreme_kind = leg_direction == 1 ? 1 : -1
+            first_chain = -1
+            second_chain = -1
+            last_chain = -1
+            n_chain = 0
+            extreme_idx = -1
+            float extreme_price = leg_direction == 1 ? -1.0e10 : 1.0e10
+            n = array.size(piv_bars)
+            for i = leg_start_idx to n - 1
+                cand_kind = array.get(piv_kinds, i)
+                cand_slab = array.get(piv_slabs, i)
+                cand_price = array.get(piv_prices, i)
+                if cand_kind == target_kind
+                    if cand_slab == target_slab
+                        if first_chain < 0
+                            first_chain := i
+                        else if second_chain < 0
+                            second_chain := i
+                        last_chain := i
+                        n_chain := n_chain + 1
+                if cand_kind == extreme_kind
+                    if leg_direction == 1
+                        if cand_price > extreme_price
+                            extreme_price := cand_price
+                            extreme_idx := i
+                    else
+                        if cand_price < extreme_price
+                            extreme_price := cand_price
+                            extreme_idx := i
+            if n_chain >= channel_min_pivots
+                if second_chain >= 0
+                    // Slope locked from first two chain pivots
+                    x1 = array.get(piv_bars, first_chain)
+                    y1 = array.get(piv_prices, first_chain)
+                    x2 = array.get(piv_bars, second_chain)
+                    y2 = array.get(piv_prices, second_chain)
+                    slope = (y2 - y1) / (x2 - x1)
+                    // Trendline extends from first chain pivot to current bar
+                    right_x = bar_index
+                    right_y_trend = y1 + slope * (right_x - x1)
+                    // Count parallel touches
+                    n_extreme_touches = 0
+                    touch_thr = na(atr14) ? 0.0 : atr14 * channel_touch_atr
+                    if extreme_idx >= 0
+                        ex_x = array.get(piv_bars, extreme_idx)
+                        ex_y = array.get(piv_prices, extreme_idx)
+                        for j = leg_start_idx to n - 1
+                            cand_kind_j = array.get(piv_kinds, j)
+                            if cand_kind_j == extreme_kind
+                                cand_x_j = array.get(piv_bars, j)
+                                cand_p_j = array.get(piv_prices, j)
+                                line_y = ex_y + slope * (cand_x_j - ex_x)
+                                if math.abs(cand_p_j - line_y) <= touch_thr
+                                    n_extreme_touches := n_extreme_touches + 1
+                    is_solid = n_chain >= 2 and n_extreme_touches >= channel_solid_extreme_touches
+                    line_w = is_solid ? 2 : 1
+                    c = leg_direction == 1 ? color.green : color.red
+                    ext = channel_extend ? extend.right : extend.none
+                    // Delete prior live lines (if any)
+                    if not na(cur_lower)
+                        line.delete(cur_lower)
+                    if not na(cur_upper)
+                        line.delete(cur_upper)
+                    // Trendline
+                    new_lower := line.new(x1, y1, right_x, right_y_trend, color=c, width=line_w, extend=ext)
+                    // Parallel through extreme
+                    if extreme_idx >= 0
                         ex_x = array.get(piv_bars, extreme_idx)
                         ex_y = array.get(piv_prices, extreme_idx)
                         y1p = ex_y + slope * (x1 - ex_x)
-                        y2p = ex_y + slope * (x2 - ex_x)
-                        pl = line.new(x1, y1p, x2, y2p, color=c, width=1, style=line.style_dashed, extend=ext)
-                        array.push(channel_lines, pl)
+                        y2p = ex_y + slope * (right_x - ex_x)
+                        new_upper := line.new(x1, y1p, right_x, y2p, color=c, width=line_w, style=line.style_dashed, extend=ext)
+    [new_lower, new_upper]
 
 // === Process detections this bar ===========================================
 thr = na(atr14) ? 0.0 : atr14 * leg_break_atr
@@ -422,16 +482,21 @@ if not na(ph_c_val)
     array.push(piv_leg_states, leg_state)
     if retro_idx >= 0
         retag_label(retro_idx, "TRANSITION")
-        // Draw channel for the leg that just ended
-        if leg_start_pivot_idx >= 0
-            draw_channel_for_leg(leg_start_pivot_idx, retro_idx, old_leg_dir_h)
+        // Orphan the completed leg's channel lines (they stay on chart as
+        // history; the new leg gets fresh live channel lines).
+        cur_leg_trendline := na
+        cur_leg_parallel := na
         leg_start_pivot_idx := new_idx
     else if legs_inc == 1
-        // First leg from INIT
         leg_start_pivot_idx := new_idx
     // Draw this pivot's label
     lab = draw_label_for(bx, bp, 1, slab, 1, leg_state)
     array.push(piv_labs, lab)
+    // Adaptive channel update for the active leg
+    if leg_dir != 0
+        [new_tl, new_pl] = update_current_channel(leg_dir, leg_start_pivot_idx, cur_leg_trendline, cur_leg_parallel)
+        cur_leg_trendline := new_tl
+        cur_leg_parallel := new_pl
 
 // --- Grade C LOW ---
 if not na(pl_c_val)
@@ -467,13 +532,17 @@ if not na(pl_c_val)
     array.push(piv_leg_states, leg_state)
     if retro_idx >= 0
         retag_label(retro_idx, "TRANSITION")
-        if leg_start_pivot_idx >= 0
-            draw_channel_for_leg(leg_start_pivot_idx, retro_idx, old_leg_dir_l)
+        cur_leg_trendline := na
+        cur_leg_parallel := na
         leg_start_pivot_idx := new_idx
     else if legs_inc == 1
         leg_start_pivot_idx := new_idx
     lab = draw_label_for(bx, bp, -1, slab, 1, leg_state)
     array.push(piv_labs, lab)
+    if leg_dir != 0
+        [new_tl, new_pl] = update_current_channel(leg_dir, leg_start_pivot_idx, cur_leg_trendline, cur_leg_parallel)
+        cur_leg_trendline := new_tl
+        cur_leg_parallel := new_pl
 
 // Helper inline: when upgrade reclassifies slab, decrement old-slab counter
 // and increment new-slab counter so the status table stays accurate.
