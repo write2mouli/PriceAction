@@ -42,12 +42,19 @@ from channels_yahoo_test import fetch_es_2m, atr  # reuse data + ATR
 # ----------------------------------------------------------------------------
 # Session filter (WIDE: include extended hours -- the morning spike is premarket)
 # ----------------------------------------------------------------------------
+# Display/session timezone. Mouli's TradingView shows /ES in PACIFIC time
+# (UTC-7 in late May = PDT), so the harness uses the same so the x-axis lines up
+# with his TV chart. The underlying Yahoo data is identical regardless; this only
+# shifts which bars fall in the "day" window and the time labels.
+TZ_OFFSET = -7  # hours from UTC (Pacific). Use -4 for ET, -5 for CT.
+
+
 def filter_session_wide(ts, o, h, l, c, target_date: dt.date,
                         start_hm=(4, 0), end_hm=(20, 0)):
     import calendar
-    # late-May US = EDT (UTC-4). ET hour + 4 = UTC hour.
-    s = dt.datetime.combine(target_date, dt.time(*start_hm)) + dt.timedelta(hours=4)
-    e = dt.datetime.combine(target_date, dt.time(*end_hm)) + dt.timedelta(hours=4)
+    # local (TZ_OFFSET) -> UTC: subtract the (negative) offset, i.e. add |offset|.
+    s = dt.datetime.combine(target_date, dt.time(*start_hm)) - dt.timedelta(hours=TZ_OFFSET)
+    e = dt.datetime.combine(target_date, dt.time(*end_hm)) - dt.timedelta(hours=TZ_OFFSET)
     s_ep = calendar.timegm(s.timetuple())
     e_ep = calendar.timegm(e.timetuple())
     m = (ts >= s_ep) & (ts <= e_ep)
@@ -549,10 +556,10 @@ def render_single(ts, o, h, l, c, pivs, label, segs, out_path):
                        color="black" if p.grade == 3 else "#777",
                        marker="v" if p.kind == 1 else "^", zorder=3)
     _draw_segs(ax, segs)
-    # ET time ticks every 30 min
+    # time ticks every 30 min, in the display timezone (Pacific, matches TV)
     et_ticks, et_labels = [], []
     for i in range(n):
-        et = dt.datetime.fromtimestamp(ts[i] - 4 * 3600, tz=dt.timezone.utc).replace(tzinfo=None)
+        et = dt.datetime.fromtimestamp(ts[i] + TZ_OFFSET * 3600, tz=dt.timezone.utc).replace(tzinfo=None)
         if et.minute % 30 == 0:
             et_ticks.append(i); et_labels.append(et.strftime("%H:%M"))
     ax.set_xticks(et_ticks); ax.set_xticklabels(et_labels, fontsize=8)
