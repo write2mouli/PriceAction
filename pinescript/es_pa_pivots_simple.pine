@@ -184,16 +184,20 @@ compute_leg_state(price, kind, pivot_idx, cur_dir, cur_anchor, cur_extreme, cur_
 
 // Array-only helper: find the latest pivot of (bar, kind) and upgrade its
 // grade label. Returns [old_grade, found_idx]; counters updated at caller.
+// Iterates ascending and overwrites `found` on every match so we end up with
+// the LATEST matching index. (Pine v5 rejects `by -1`; descending loops are
+// not supported with negative step.)
 upgrade_pivot_grade(bx, kind, new_grade) =>
     n = array.size(piv_bars)
     found = -1
     old_grade = 0
     if n > 0
-        for i = n - 1 to 0 by -1
-            if array.get(piv_bars, i) == bx
-                if array.get(piv_kinds, i) == kind
+        for i = 0 to n - 1
+            cand_bar = array.get(piv_bars, i)
+            cand_kind = array.get(piv_kinds, i)
+            if cand_bar == bx
+                if cand_kind == kind
                     found := i
-                    break
         if found >= 0
             old_grade := array.get(piv_grades, found)
             if new_grade > old_grade
