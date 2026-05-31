@@ -143,6 +143,10 @@ var array<line> mfin_cen   = array.new<line>(0)
 // recomputed each pivot. When that regression stops fitting, the segment is
 // finalized and a new one starts at the prior pivot.
 var int   m_seg_start_idx = -1
+// Diagnostic: count major leg starts/transitions, to compare the Pine major leg
+// machine against the Python run_leg_machine (which is clean at break=1.5). A
+// much higher count at the same threshold pins the flip-flop on a divergence.
+var int   m_legs = 0
 
 // Counters
 var int n_hh = 0
@@ -867,6 +871,7 @@ if timeframe.change("1D")
     m_el_idx    := -1
     m_eh_price  := na
     m_el_price  := na
+    m_legs      := 0   // reset the per-day major-leg counter
 
 // --- Grade C HIGH ---
 if not na(ph_c_val)
@@ -1085,6 +1090,8 @@ if not na(ph_a_val)
         m_el_idx   := m_nel
         m_eh_price := m_nehp
         m_el_price := m_nelp
+        if m_retro >= 0 or m_inc == 1
+            m_legs := m_legs + 1
         if m_retro >= 0
             // Major CHoCH: a higher high broke the downtrend's resistance chain
             // -> change of character UP. Mark it, finalize the segment, restart.
@@ -1170,6 +1177,8 @@ if not na(pl_a_val)
         m_el_idx   := m_nel
         m_eh_price := m_nehp
         m_el_price := m_nelp
+        if m_retro >= 0 or m_inc == 1
+            m_legs := m_legs + 1
         if m_retro >= 0
             // Major CHoCH: a lower low broke the uptrend's SUPPORT chain ->
             // change of character DOWN. Mark it, finalize the segment, restart.
@@ -1226,7 +1235,7 @@ if not na(pl_a_val)
 // a lower swing low is.)
 
 // Status table ---------------------------------------------------------------
-var table tbl = table.new(position.top_right, 2, 13, bgcolor=color.new(color.gray, 80), border_width=1)
+var table tbl = table.new(position.top_right, 2, 14, bgcolor=color.new(color.gray, 80), border_width=1)
 if barstate.islast
     leg_dir_s = leg_dir == 0 ? "INIT" : leg_dir == 1 ? "UP" : "DOWN"
     table.cell(tbl, 0, 0, "Leg dir", text_color=color.black, text_size=size.normal)
@@ -1256,3 +1265,5 @@ if barstate.islast
     m_dir_s = m_leg_dir == 0 ? "INIT" : m_leg_dir == 1 ? "UP" : "DOWN"
     table.cell(tbl, 0, 12, "Major dir", text_color=color.teal, text_size=size.small)
     table.cell(tbl, 1, 12, m_dir_s, text_color=color.teal, text_size=size.small)
+    table.cell(tbl, 0, 13, "Major legs", text_color=color.teal, text_size=size.small)
+    table.cell(tbl, 1, 13, str.tostring(m_legs), text_color=color.teal, text_size=size.small)
