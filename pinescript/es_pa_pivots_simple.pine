@@ -109,6 +109,10 @@ var int n_a  = 0
 var int n_b  = 0
 var int n_c  = 0
 var int n_legs = 0
+// Diagnostic: count how many times we've actually drawn a channel line
+var int n_channel_draws = 0
+// Diagnostic: last n_chain value seen by update_current_channel
+var int last_n_chain = 0
 
 // Pure helpers (no global mutation) -----------------------------------------
 size_for_grade(grade) =>
@@ -363,10 +367,13 @@ retag_label(idx, new_leg_state) =>
 // AND the parallel has >= channel_solid_extreme_touches, the channel
 // is drawn at width 2 (solid look); otherwise width 1 (tentative).
 //
-// Returns [new_trendline, new_parallel] -- caller assigns to globals.
+// Returns [new_trendline, new_parallel, n_chain_found, second_chain_idx]
+// -- caller assigns to globals + can read diagnostics.
 update_current_channel(leg_direction, leg_start_idx, cur_lower, cur_upper) =>
     new_lower = cur_lower
     new_upper = cur_upper
+    dbg_n_chain = 0
+    dbg_second_chain = -1
     if show_channels
         if leg_start_idx >= 0
             target_slab = leg_direction == 1 ? "HL" : "LH"
@@ -400,6 +407,8 @@ update_current_channel(leg_direction, leg_start_idx, cur_lower, cur_upper) =>
                         if cand_price < extreme_price
                             extreme_price := cand_price
                             extreme_idx := i
+            dbg_n_chain := n_chain
+            dbg_second_chain := second_chain
             if n_chain >= channel_min_pivots
                 if second_chain >= 0
                     // Slope locked from first two chain pivots
@@ -443,7 +452,7 @@ update_current_channel(leg_direction, leg_start_idx, cur_lower, cur_upper) =>
                         y1p = ex_y + slope * (x1 - ex_x)
                         y2p = ex_y + slope * (right_x - ex_x)
                         new_upper := line.new(x1, y1p, right_x, y2p, color=c, width=line_w, style=line.style_dashed, extend=ext)
-    [new_lower, new_upper]
+    [new_lower, new_upper, dbg_n_chain, dbg_second_chain]
 
 // === Process detections this bar ===========================================
 thr = na(atr14) ? 0.0 : atr14 * leg_break_atr
@@ -510,9 +519,12 @@ if not na(ph_c_val)
     array.push(piv_labs, lab)
     // Adaptive channel update for the current epoch
     if leg_dir != 0
-        [new_tl, new_pl] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel)
+        [new_tl, new_pl, dbg_n, dbg_sc] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel)
         cur_leg_trendline := new_tl
         cur_leg_parallel := new_pl
+        last_n_chain := dbg_n
+        if not na(new_tl)
+            n_channel_draws := n_channel_draws + 1
 
 // --- Grade C LOW ---
 if not na(pl_c_val)
@@ -565,9 +577,12 @@ if not na(pl_c_val)
     lab = draw_label_for(bx, bp, -1, slab, 1, leg_state)
     array.push(piv_labs, lab)
     if leg_dir != 0
-        [new_tl, new_pl] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel)
+        [new_tl, new_pl, dbg_n, dbg_sc] = update_current_channel(leg_dir, channel_epoch_start_idx, cur_leg_trendline, cur_leg_parallel)
         cur_leg_trendline := new_tl
         cur_leg_parallel := new_pl
+        last_n_chain := dbg_n
+        if not na(new_tl)
+            n_channel_draws := n_channel_draws + 1
 
 // Helper inline: when upgrade reclassifies slab, decrement old-slab counter
 // and increment new-slab counter so the status table stays accurate.
@@ -646,26 +661,30 @@ if not na(pl_a_val)
                 n_ll := n_ll + 1
 
 // Status table ---------------------------------------------------------------
-var table tbl = table.new(position.top_right, 2, 10, bgcolor=color.new(color.gray, 80), border_width=1)
+var table tbl = table.new(position.top_right, 2, 12, bgcolor=color.new(color.gray, 80), border_width=1)
 if barstate.islast
     leg_dir_s = leg_dir == 0 ? "INIT" : leg_dir == 1 ? "UP" : "DOWN"
     table.cell(tbl, 0, 0, "Leg dir", text_color=color.black, text_size=size.normal)
     table.cell(tbl, 1, 0, leg_dir_s, text_color=color.black, text_size=size.normal)
-    table.cell(tbl, 0, 1, "Legs",    text_color=color.black, text_size=size.small)
-    table.cell(tbl, 1, 1, str.tostring(n_legs), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 2, "Grade A", text_color=color.black, text_size=size.small)
-    table.cell(tbl, 1, 2, str.tostring(n_a), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 3, "Grade B", text_color=color.black, text_size=size.small)
-    table.cell(tbl, 1, 3, str.tostring(n_b), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 4, "Grade C", text_color=color.black, text_size=size.small)
-    table.cell(tbl, 1, 4, str.tostring(n_c), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 5, "HH", text_color=color.green, text_size=size.small)
-    table.cell(tbl, 1, 5, str.tostring(n_hh), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 6, "HL", text_color=color.green, text_size=size.small)
-    table.cell(tbl, 1, 6, str.tostring(n_hl), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 7, "LH", text_color=color.red,   text_size=size.small)
-    table.cell(tbl, 1, 7, str.tostring(n_lh), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 8, "LL", text_color=color.red,   text_size=size.small)
-    table.cell(tbl, 1, 8, str.tostring(n_ll), text_color=color.black, text_size=size.small)
-    table.cell(tbl, 0, 9, "?",  text_color=color.gray,  text_size=size.small)
-    table.cell(tbl, 1, 9, str.tostring(n_q),  text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 1, "Channels drawn", text_color=color.blue, text_size=size.small)
+    table.cell(tbl, 1, 1, str.tostring(n_channel_draws), text_color=color.blue, text_size=size.small)
+    table.cell(tbl, 0, 2, "Last n_chain", text_color=color.blue, text_size=size.small)
+    table.cell(tbl, 1, 2, str.tostring(last_n_chain), text_color=color.blue, text_size=size.small)
+    table.cell(tbl, 0, 3, "Legs",    text_color=color.black, text_size=size.small)
+    table.cell(tbl, 1, 3, str.tostring(n_legs), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 4, "Grade A", text_color=color.black, text_size=size.small)
+    table.cell(tbl, 1, 4, str.tostring(n_a), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 5, "Grade B", text_color=color.black, text_size=size.small)
+    table.cell(tbl, 1, 5, str.tostring(n_b), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 6, "Grade C", text_color=color.black, text_size=size.small)
+    table.cell(tbl, 1, 6, str.tostring(n_c), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 7, "HH", text_color=color.green, text_size=size.small)
+    table.cell(tbl, 1, 7, str.tostring(n_hh), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 8, "HL", text_color=color.green, text_size=size.small)
+    table.cell(tbl, 1, 8, str.tostring(n_hl), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 9, "LH", text_color=color.red,   text_size=size.small)
+    table.cell(tbl, 1, 9, str.tostring(n_lh), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 10, "LL", text_color=color.red,  text_size=size.small)
+    table.cell(tbl, 1, 10, str.tostring(n_ll), text_color=color.black, text_size=size.small)
+    table.cell(tbl, 0, 11, "?",  text_color=color.gray, text_size=size.small)
+    table.cell(tbl, 1, 11, str.tostring(n_q),  text_color=color.black, text_size=size.small)
